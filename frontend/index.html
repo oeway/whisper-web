@@ -18,7 +18,7 @@
       <div>
         <p class="text-sm uppercase tracking-[0.25em] text-emerald-300">Whisper</p>
         <h1 class="text-2xl font-semibold">Voice Transcription</h1>
-        <p class="text-slate-400 text-sm">Record, then transcribe</p>
+        <p class="text-slate-400 text-sm">VAD-filtered recording with batch transcription</p>
       </div>
       <div class="flex flex-col gap-2 text-sm">
         <select id="modelSelect" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-400">
@@ -53,6 +53,7 @@
           <span id="statusText">Click mic to start recording.</span>
         </div>
         <div id="timer" class="text-3xl font-mono text-slate-300 tabular-nums">00:00</div>
+        <div id="chunkInfo" class="hidden text-xs font-mono text-slate-500"></div>
         <div id="loadingRow" class="hidden flex items-center gap-1 text-xs text-amber-300">
           <span>Transcribing</span>
           <span class="loading-dot">.</span>
@@ -65,8 +66,9 @@
     <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 space-y-3">
       <div class="flex items-center justify-between">
         <p class="text-sm text-slate-400">Transcript</p>
-        <div id="stats" class="hidden flex gap-4 text-xs font-mono text-slate-500">
+        <div id="stats" class="hidden flex flex-wrap gap-x-4 gap-y-1 text-xs font-mono text-slate-500">
           <span id="statDuration"></span>
+          <span id="statChunks"></span>
           <span id="statFileSize"></span>
           <span id="statProcessTime"></span>
           <span id="statModel"></span>
@@ -82,6 +84,7 @@
   </div>
 
 <script>
+// ---- DOM refs ----
 const micBtn     = document.getElementById('micBtn');
 const micIcon    = document.getElementById('micIcon');
 const stopIcon   = document.getElementById('stopIcon');
@@ -89,29 +92,51 @@ const micRing    = document.getElementById('micRing');
 const statusDot  = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const timerEl    = document.getElementById('timer');
+const chunkInfo  = document.getElementById('chunkInfo');
 const loadingRow = document.getElementById('loadingRow');
 const transcriptEl = document.getElementById('transcript');
 const modelSelect  = document.getElementById('modelSelect');
 const langSelect   = document.getElementById('langSelect');
 const promptInput  = document.getElementById('prompt');
-const statsEl       = document.getElementById('stats');
-const statDuration  = document.getElementById('statDuration');
-const statFileSize  = document.getElementById('statFileSize');
+const statsEl        = document.getElementById('stats');
+const statDuration   = document.getElementById('statDuration');
+const statChunks     = document.getElementById('statChunks');
+const statFileSize   = document.getElementById('statFileSize');
 const statProcessTime = document.getElementById('statProcessTime');
-const statModel     = document.getElementById('statModel');
+const statModel      = document.getElementById('statModel');
 
+// ---- State ----
 let isRecording = false;
 let isTranscribing = false;
+let sessionId = null;
 let mediaStream = null;
 let audioCtx = null;
 let sourceNode = null;
 let processorNode = null;
-let pcmBuffers = [];
-let pcmLength = 0;
+let chunkTimer = null;
+let timerInterval = null;
 let recordStart = 0;
 let recordDurationS = 0;
-let recordedSampleRate = 48000;
-let timerInterval = null;
+
+// PCM accumulator (between flushes)
+let pcmBuffers = [];
+let pcmLength = 0;
+
+// VAD state
+let speaking = false;
+let lastSpeech = 0;
+let noiseFloor = 0.004;
+let vadWarmupUntil = 0;
+let silentStreak = 0;
+
+// Chunk upload tracking
+let chunksSent = 0;
+let totalBytesSent = 0;
+
+// VAD tuning
+const CHUNK_MS = 1500;
+const VAD_THRESHOLD = 0.012;
+const VAD_HANGOVER_MS = 800;
 
 // ---- UI helpers ----
 function setRecordingUI(active) {
@@ -120,8 +145,7 @@ function setRecordingUI(active) {
   micRing.style.opacity = active ? 0.5 : 0;
   statusDot.style.backgroundColor = active ? '#f87171' : '#64748b';
   micBtn.style.background = active
-    ? 'linear-gradient(135deg, #f87171, #ef4444)'
-    : '';
+    ? 'linear-gradient(135deg, #f87171, #ef4444)' : '';
 }
 
 function updateTimer() {
@@ -129,6 +153,17 @@ function updateTimer() {
   const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
   const s = String(elapsed % 60).padStart(2, '0');
   timerEl.textContent = `${m}:${s}`;
+}
+
+function updateChunkInfo() {
+  chunkInfo.classList.remove('hidden');
+  chunkInfo.textContent = `${chunksSent} chunks sent · ${formatBytes(totalBytesSent)} uploaded`;
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
 }
 
 // ---- WAV encoding ----
@@ -165,6 +200,41 @@ function mergeBuffers(buffers, length) {
   return out;
 }
 
+// ---- Chunk flushing with VAD ----
+async function flushChunk(force = false) {
+  if (pcmLength === 0 || !audioCtx) return;
+  const now = performance.now();
+  const inWarmup = now < vadWarmupUntil;
+  const active = force || inWarmup || speaking || (now - lastSpeech < VAD_HANGOVER_MS);
+
+  const merged = mergeBuffers(pcmBuffers, pcmLength);
+  pcmBuffers = [];
+  pcmLength = 0;
+
+  if (!active) {
+    silentStreak += 1;
+    return; // skip silent chunk
+  }
+  silentStreak = 0;
+
+  const wavBlob = encodeWav(merged, audioCtx.sampleRate);
+  if (wavBlob.size < 1200) return; // too tiny
+
+  // Upload chunk to session buffer on backend
+  const form = new FormData();
+  form.append('chunk', wavBlob, 'chunk.wav');
+  try {
+    const resp = await fetch(`/api/session/${sessionId}/chunk`, { method: 'POST', body: form });
+    if (resp.ok) {
+      chunksSent += 1;
+      totalBytesSent += wavBlob.size;
+      updateChunkInfo();
+    }
+  } catch (e) {
+    // Network error — non-fatal, chunk is lost but recording continues
+  }
+}
+
 // ---- Recording ----
 async function startRecording() {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -178,6 +248,10 @@ async function startRecording() {
     return;
   }
 
+  sessionId = crypto.randomUUID();
+  chunksSent = 0;
+  totalBytesSent = 0;
+
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   sourceNode = audioCtx.createMediaStreamSource(mediaStream);
   processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
@@ -190,15 +264,33 @@ async function startRecording() {
 
   pcmBuffers = [];
   pcmLength = 0;
+  speaking = false;
+  lastSpeech = 0;
+  noiseFloor = 0.004;
+  silentStreak = 0;
+  vadWarmupUntil = performance.now() + 3000; // send first 3s unconditionally
 
   processorNode.onaudioprocess = (e) => {
     if (!isRecording) return;
     const input = e.inputBuffer.getChannelData(0);
+
+    // VAD: compute RMS and update adaptive noise floor
+    let sum = 0;
+    for (let i = 0; i < input.length; i++) { sum += input[i] * input[i]; }
+    const rms = Math.sqrt(sum / input.length);
+    noiseFloor = 0.97 * noiseFloor + 0.03 * Math.min(rms, noiseFloor * 3);
+    const threshold = Math.max(VAD_THRESHOLD * 0.35, noiseFloor * 2.2);
+    speaking = rms > threshold;
+    if (speaking) lastSpeech = performance.now();
+
     const copy = new Float32Array(input.length);
     copy.set(input);
     pcmBuffers.push(copy);
     pcmLength += copy.length;
   };
+
+  // Flush chunks periodically
+  chunkTimer = setInterval(() => flushChunk(false), CHUNK_MS);
 
   isRecording = true;
   recordStart = Date.now();
@@ -207,13 +299,21 @@ async function startRecording() {
   setRecordingUI(true);
   statusText.textContent = 'Recording... Click to stop.';
   transcriptEl.textContent = '';
+  statsEl.classList.add('hidden');
+  chunkInfo.classList.add('hidden');
 }
 
 async function stopRecording() {
   isRecording = false;
   clearInterval(timerInterval);
+  clearInterval(chunkTimer);
   recordDurationS = (Date.now() - recordStart) / 1000;
-  recordedSampleRate = audioCtx ? audioCtx.sampleRate : 48000;
+
+  // Flush any remaining audio
+  if (pcmLength > 0 && audioCtx) {
+    await flushChunk(true);
+  }
+
   if (processorNode) processorNode.disconnect();
   if (sourceNode) sourceNode.disconnect();
   if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
@@ -221,55 +321,30 @@ async function stopRecording() {
 
   setRecordingUI(false);
 
-  if (pcmLength === 0) {
-    statusText.textContent = 'No audio recorded. Try again.';
+  if (chunksSent === 0) {
+    statusText.textContent = 'No speech detected. Try again.';
     return;
   }
 
-  const merged = mergeBuffers(pcmBuffers, pcmLength);
-  pcmBuffers = [];
-  pcmLength = 0;
-
-  await transcribe(merged, recordedSampleRate);
+  // Trigger server-side transcription of all accumulated chunks
+  await transcribeSession();
 }
 
-function formatBytes(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-}
-
-function showStats(data) {
-  const dur = recordDurationS.toFixed(1);
-  const speed = (recordDurationS / data.processing_time_s).toFixed(1);
-  statDuration.textContent = `duration: ${dur}s`;
-  statFileSize.textContent = `file: ${formatBytes(data.file_size_bytes)}`;
-  statProcessTime.textContent = `transcribe: ${data.processing_time_s.toFixed(2)}s (${speed}x RT)`;
-  statModel.textContent = `model: ${data.model}`;
-  statsEl.classList.remove('hidden');
-}
-
-async function transcribe(samples, sampleRate) {
+async function transcribeSession() {
   isTranscribing = true;
   micBtn.disabled = true;
   micBtn.style.opacity = 0.5;
   statusText.textContent = 'Transcribing...';
   loadingRow.classList.remove('hidden');
-  statsEl.classList.add('hidden');
-
-  const wavBlob = encodeWav(samples, sampleRate);
-  const form = new FormData();
-  form.append('audio', wavBlob, 'recording.wav');
 
   const params = new URLSearchParams({
     model_size: modelSelect.value,
     language: langSelect.value,
-    audio_format: 'audio/wav',
     prompt: promptInput.value,
   });
 
   try {
-    const resp = await fetch(`/api/transcribe?${params}`, { method: 'POST', body: form });
+    const resp = await fetch(`/api/session/${sessionId}/transcribe?${params}`, { method: 'POST' });
     if (!resp.ok) {
       const err = await resp.text();
       transcriptEl.textContent = `Error: ${err}`;
@@ -289,6 +364,17 @@ async function transcribe(samples, sampleRate) {
     statusText.textContent = 'Done. Click mic to record again.';
     statusDot.style.backgroundColor = '#34d399';
   }
+}
+
+function showStats(data) {
+  const dur = recordDurationS.toFixed(1);
+  const speed = (recordDurationS / data.processing_time_s).toFixed(1);
+  statDuration.textContent = `duration: ${dur}s`;
+  statChunks.textContent = `chunks: ${data.chunks}`;
+  statFileSize.textContent = `audio: ${formatBytes(data.file_size_bytes)}`;
+  statProcessTime.textContent = `transcribe: ${data.processing_time_s.toFixed(2)}s (${speed}x RT)`;
+  statModel.textContent = `model: ${data.model}`;
+  statsEl.classList.remove('hidden');
 }
 
 // ---- Button ----

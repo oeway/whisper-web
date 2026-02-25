@@ -1,12 +1,14 @@
 import asyncio
+import io
 import os
 import platform
+import struct
 import tempfile
 import time
 import logging
 import concurrent.futures
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, List, Optional, Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,6 +59,63 @@ MLX_MODEL_MAP = {
 _transcription_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="whisper"
 )
+
+# In-memory session store: session_id -> list of raw WAV bytes
+_sessions: Dict[str, List[bytes]] = {}
+
+
+# ---------------------------------------------------------------------------
+# WAV concatenation helper
+# ---------------------------------------------------------------------------
+def _concat_wav_chunks(chunks: List[bytes]) -> bytes:
+    """Concatenate multiple WAV files into a single WAV.
+
+    Reads the header from the first chunk to determine sample rate / format,
+    then strips headers from subsequent chunks and writes one combined file.
+    """
+    if not chunks:
+        return b""
+    if len(chunks) == 1:
+        return chunks[0]
+
+    # Parse header from the first chunk (standard 44-byte PCM WAV header)
+    first = chunks[0]
+    if len(first) < 44:
+        return first
+    sample_rate = struct.unpack_from("<I", first, 24)[0]
+    num_channels = struct.unpack_from("<H", first, 22)[0]
+    bits_per_sample = struct.unpack_from("<H", first, 34)[0]
+    block_align = num_channels * (bits_per_sample // 8)
+    byte_rate = sample_rate * block_align
+
+    # Collect PCM data from all chunks (skip 44-byte headers)
+    pcm_parts: List[bytes] = []
+    for wav_bytes in chunks:
+        if len(wav_bytes) > 44:
+            pcm_parts.append(wav_bytes[44:])
+        else:
+            pcm_parts.append(wav_bytes)
+
+    pcm_data = b"".join(pcm_parts)
+    data_size = len(pcm_data)
+
+    # Build new WAV header
+    buf = io.BytesIO()
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + data_size))
+    buf.write(b"WAVE")
+    buf.write(b"fmt ")
+    buf.write(struct.pack("<I", 16))                # PCM chunk size
+    buf.write(struct.pack("<H", 1))                 # PCM format
+    buf.write(struct.pack("<H", num_channels))
+    buf.write(struct.pack("<I", sample_rate))
+    buf.write(struct.pack("<I", byte_rate))
+    buf.write(struct.pack("<H", block_align))
+    buf.write(struct.pack("<H", bits_per_sample))
+    buf.write(b"data")
+    buf.write(struct.pack("<I", data_size))
+    buf.write(pcm_data)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -161,19 +220,6 @@ app.add_middleware(
 )
 
 
-def _detect_suffix(format_hint: str, filename: str, content_type: str) -> str:
-    fh, fn, ct = format_hint.lower(), filename.lower(), content_type.lower()
-    if "wav" in fh or fn.endswith(".wav") or "wav" in ct:
-        return ".wav"
-    if "mp4" in fh or "m4a" in fh or fn.endswith(".mp4") or "mp4" in ct:
-        return ".mp4"
-    if "ogg" in fh or fn.endswith(".ogg") or "ogg" in ct:
-        return ".ogg"
-    if "webm" in fh or fn.endswith(".webm") or "webm" in ct:
-        return ".webm"
-    return ".webm"
-
-
 @app.on_event("shutdown")
 async def _shutdown():
     _transcription_executor.shutdown(wait=False)
@@ -190,39 +236,59 @@ async def health():
     }
 
 
-@app.post("/api/transcribe")
-async def transcribe(
-    audio: UploadFile = File(...),
+@app.post("/api/session/{session_id}/chunk")
+async def upload_chunk(
+    session_id: str,
+    chunk: UploadFile = File(...),
+):
+    """Receive a single WAV chunk and append it to the session buffer."""
+    audio_bytes = await chunk.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="empty chunk")
+    if session_id not in _sessions:
+        _sessions[session_id] = []
+    _sessions[session_id].append(audio_bytes)
+    total = sum(len(c) for c in _sessions[session_id])
+    return {
+        "chunks": len(_sessions[session_id]),
+        "total_bytes": total,
+    }
+
+
+@app.post("/api/session/{session_id}/transcribe")
+async def transcribe_session(
+    session_id: str,
     model_size: str = DEFAULT_MODEL_SIZE,
     language: str = "auto",
-    audio_format: str = "",
     prompt: str = "",
 ):
-    """Accept a complete audio recording and return the transcript."""
-    audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="empty audio")
+    """Concatenate all chunks for this session and transcribe as one audio."""
+    chunks = _sessions.pop(session_id, [])
+    if not chunks:
+        raise HTTPException(status_code=404, detail="no audio for this session")
 
-    suffix = _detect_suffix(audio_format, audio.filename or "", audio.content_type or "")
+    combined = _concat_wav_chunks(chunks)
+    file_size = len(combined)
+    num_chunks = len(chunks)
+
     model_or_repo = await model_pool.get(model_size)
-
-    file_size = len(audio_bytes)
     t0 = time.monotonic()
 
     loop = asyncio.get_event_loop()
     text = await loop.run_in_executor(
         _transcription_executor,
         transcribe_bytes,
-        model_or_repo, audio_bytes, suffix, language, prompt,
+        model_or_repo, combined, ".wav", language, prompt,
     )
 
     elapsed = time.monotonic() - t0
     log.info(
-        "Transcribed %s bytes in %.2fs (model=%s, lang=%s, prompt=%r)",
-        file_size, elapsed, model_size, language, prompt[:40] if prompt else "",
+        "Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s)",
+        num_chunks, file_size, elapsed, model_size, language,
     )
     return {
         "text": text,
+        "chunks": num_chunks,
         "file_size_bytes": file_size,
         "processing_time_s": round(elapsed, 3),
         "model": model_size,
