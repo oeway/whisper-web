@@ -179,6 +179,42 @@ Returns server status and active backend info.
 }
 ```
 
+## JavaScript SDK
+
+A browser ES module is served at `/whisper-client.js` for integrating transcription into your own web apps. TypeScript declarations are at `/whisper-client.d.ts`.
+
+```js
+import { WhisperClient } from 'http://localhost:8000/whisper-client.js';
+
+const client = new WhisperClient({
+  server: 'http://localhost:8000',  // default: same origin
+  token: 'your-hypha-token',        // optional
+  model: 'small',                    // tiny | base | small | medium | large-v3
+  language: 'auto',                  // language code or 'auto'
+  prompt: '',                        // optional initial prompt
+});
+
+// Check server health
+const health = await client.getHealth();
+
+// Option A: Record from microphone with VAD
+client.onChunkUploaded = (info) => console.log(info.chunks, info.totalBytes);
+client.onStatusChange = (status) => console.log(status);
+
+await client.startRecording();
+const result = await client.stopRecording();
+console.log(result.text);
+// result: { text, chunks, file_size_bytes, processing_time_s, model, language, prompt }
+
+// Option B: Transcribe a file directly
+const result2 = await client.transcribe(audioBlob);
+
+// Cleanup
+client.destroy();
+```
+
+The `GET /sdk` endpoint redirects to `/whisper-client.js` for discoverability.
+
 ## How It Works
 
 ### Architecture
@@ -200,15 +236,19 @@ Browser                              Server
 └──────────────────┘               └──────────────────────────┘
 ```
 
-### Frontend (`frontend/index.html`)
+### Frontend
 
-A single HTML file with inline JavaScript. No build step, no dependencies beyond Tailwind CSS (loaded from CDN).
+- **`frontend/whisper-client.js`** — ES module SDK (`WhisperClient` class). Contains all recording, VAD, WAV encoding, chunk streaming, and API interaction logic.
+- **`frontend/whisper-client.d.ts`** — TypeScript type declarations for the SDK.
+- **`frontend/index.html`** — Demo UI that imports the SDK. No build step, no dependencies beyond Tailwind CSS (CDN).
 
-- **Recording:** Uses `getUserMedia` to access the microphone and a `ScriptProcessor` to capture raw PCM audio samples into a buffer.
-- **VAD:** Adaptive noise floor with RMS threshold filters out silence. Only speech chunks are sent to the server during recording.
-- **Encoding:** PCM buffers are encoded into WAV (16-bit mono) in the browser and streamed as chunks.
-- **Transcription:** On stop, the frontend triggers the server to concatenate all chunks and transcribe as one audio.
-- **Display:** The JSON response is parsed and the transcript text and performance stats are rendered.
+The SDK handles:
+
+- **Recording:** Uses `getUserMedia` + `ScriptProcessor` to capture raw PCM audio.
+- **VAD:** Adaptive noise floor with RMS threshold filters out silence.
+- **Encoding:** PCM buffers encoded to WAV (16-bit mono) in the browser.
+- **Chunk streaming:** Speech chunks uploaded to the server during recording.
+- **Transcription:** On stop, triggers server-side concatenation and transcription.
 
 ### Backend (`backend/whisper_streamer/main.py`)
 
