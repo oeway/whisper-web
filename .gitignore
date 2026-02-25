@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv_sys/
+conda-env/
+
+# OS
+.DS_Store
+screenlog.*
+
+# IDE
+.idea/
+.vscode/
+
+# Unrelated projects
+VoiceInk/

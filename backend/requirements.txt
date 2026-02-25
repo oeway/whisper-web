@@ -1,0 +1,14 @@
+# Core dependencies (all platforms)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# Transcription backend — install ONE based on your platform:
+#
+# Apple Silicon (M1/M2/M3/M4) — uses Metal GPU acceleration:
+#   pip install mlx-whisper
+#
+# Linux with CUDA / CPU (Windows, Intel Mac):
+#   pip install faster-whisper
+#
+# The server auto-detects which backend is available at startup.

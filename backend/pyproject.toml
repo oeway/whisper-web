@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whisper-web"
+version = "0.1.0"
+description = "Web-based voice transcription using Whisper with Apple Silicon (MLX) and Linux CUDA support"
+authors = [{name = "oeway"}]
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+apple = ["mlx-whisper>=0.4.0"]
+cuda = ["faster-whisper>=1.0.3"]
+cpu = ["faster-whisper>=1.0.3"]
+dev = ["pytest", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["whisper_streamer"]
