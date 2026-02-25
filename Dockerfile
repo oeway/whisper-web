@@ -11,12 +11,11 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies (CPU variant)
-COPY backend/pyproject.toml backend/
+# Copy backend source and install (hatchling needs the source to build)
+COPY backend/ backend/
 RUN pip install --no-cache-dir ./backend[cpu]
 
-# Copy application code
-COPY backend/ backend/
+# Copy frontend
 COPY frontend/ frontend/
 
 # Create non-root user and writable data directory
