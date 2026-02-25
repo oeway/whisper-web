@@ -67,11 +67,44 @@ Environment variables:
 | `WHISPER_MAX_WORKERS` | `2` | Max parallel transcription threads |
 | `WHISPER_SESSION_TTL` | `600` | Seconds before idle sessions are evicted |
 | `WHISPER_MAX_CHUNK_BYTES` | `52428800` | Max total session size in bytes (50 MB) |
+| `WHISPER_REQUIRE_AUTH` | `false` | Require Hypha token for all API requests |
+| `HYPHA_TOKEN_URL` | `https://hypha.aicell.io/public/services/ws/parse_token` | Hypha token validation endpoint |
+| `WHISPER_ACTIVITY_LOG` | `activity.jsonl` | Path to the JSON Lines activity log |
 
 Example:
 
 ```bash
-WHISPER_MODEL_SIZE=medium WHISPER_MAX_WORKERS=4 uvicorn whisper_streamer.main:app --host 0.0.0.0 --port 8000
+WHISPER_REQUIRE_AUTH=true WHISPER_MODEL_SIZE=medium uvicorn whisper_streamer.main:app --host 0.0.0.0 --port 8000
+```
+
+## Authentication
+
+Set `WHISPER_REQUIRE_AUTH=true` to require a valid [Hypha](https://hypha.aicell.io) token on every API request. Tokens can be passed via:
+
+- **Header:** `Authorization: Bearer <token>`
+- **Query parameter:** `?token=<token>`
+
+Both Auth0 JWTs and Hypha client-credentials tokens are supported. When auth is disabled (the default), tokens are still accepted and logged if provided.
+
+```bash
+curl -X POST "http://localhost:8000/api/transcribe?model_size=small" \
+  -H "Authorization: Bearer $HYPHA_TOKEN" \
+  -F "audio=@recording.wav"
+```
+
+## Activity Log
+
+Every chunk upload and transcription is logged as a JSON line to `activity.jsonl` (configurable via `WHISPER_ACTIVITY_LOG`). Each entry includes:
+
+- `timestamp`, `action` (`chunk_upload` or `transcribe`)
+- `user_id`, `user_email` (when authenticated)
+- `client_ip`, `session_id`, `model`, `language`
+- `chunks`, `file_size_bytes`, `processing_time_s`, `text_length`
+
+Example entry:
+
+```json
+{"timestamp": "2026-02-25T20:55:02Z", "action": "transcribe", "user_id": "github|478667", "user_email": "oeway007@gmail.com", "client_ip": "127.0.0.1", "session_id": "s1", "model": "small", "language": "en", "chunks": 5, "file_size_bytes": 162000, "processing_time_s": 0.82, "text_length": 45}
 ```
 
 ## API
@@ -141,7 +174,8 @@ Returns server status and active backend info.
   "backend": "mlx-whisper",
   "default_model": "small",
   "device": "apple-silicon-gpu",
-  "compute_type": "mlx-float16"
+  "compute_type": "mlx-float16",
+  "auth_required": false
 }
 ```
 

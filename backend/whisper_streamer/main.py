@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import platform
 import struct
@@ -10,7 +11,8 @@ import concurrent.futures
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, Query
+import httpx
+from fastapi import FastAPI, File, HTTPException, UploadFile, Query, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -50,6 +52,23 @@ MAX_CHUNK_BYTES = int(os.getenv("WHISPER_MAX_CHUNK_BYTES", str(50 * 1024 * 1024)
 MAX_WORKERS = int(os.getenv("WHISPER_MAX_WORKERS", "2"))
 SESSION_TTL_SECONDS = int(os.getenv("WHISPER_SESSION_TTL", "600"))  # 10 minutes
 
+# Auth: set WHISPER_REQUIRE_AUTH=true to require Hypha token validation
+REQUIRE_AUTH = os.getenv("WHISPER_REQUIRE_AUTH", "").lower() in ("true", "1", "yes")
+HYPHA_TOKEN_URL = os.getenv(
+    "HYPHA_TOKEN_URL",
+    "https://hypha.aicell.io/public/services/ws/parse_token",
+)
+
+# Structured activity logger — writes one JSON line per transcription
+_activity_log = logging.getLogger("whisper_activity")
+_activity_log.setLevel(logging.INFO)
+_activity_log.propagate = False
+_activity_handler = logging.FileHandler(
+    os.getenv("WHISPER_ACTIVITY_LOG", "activity.jsonl"),
+)
+_activity_handler.setFormatter(logging.Formatter("%(message)s"))
+_activity_log.addHandler(_activity_handler)
+
 MLX_MODEL_MAP = {
     "tiny": "mlx-community/whisper-tiny-mlx",
     "base": "mlx-community/whisper-base-mlx",
@@ -82,6 +101,114 @@ def _evict_stale_sessions() -> int:
     if stale:
         log.info("Evicted %d stale session(s): %s", len(stale), stale)
     return len(stale)
+
+
+# ---------------------------------------------------------------------------
+# Token authentication via Hypha
+# ---------------------------------------------------------------------------
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10.0)
+    return _http_client
+
+
+async def _validate_token(token: str) -> dict:
+    """Call Hypha parse_token and return user info dict.
+
+    Supports two token types:
+      1. Auth0 JWT — validated by Hypha without extra auth headers
+      2. Hypha client-credentials JWT — requires Bearer auth on the request itself
+    We always send the token as both the body payload and the Authorization header
+    so both token types work transparently.
+    """
+    client = await _get_http_client()
+    resp = await client.post(
+        HYPHA_TOKEN_URL,
+        json={"token": token},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="token validation failed")
+    data = resp.json()
+    if isinstance(data, dict) and data.get("id"):
+        return data
+    raise HTTPException(status_code=401, detail=data.get("detail", "invalid token"))
+
+
+async def get_current_user(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+) -> Optional[dict]:
+    """FastAPI dependency: resolve user from token if auth is required.
+
+    Token can be passed via:
+      - Authorization: Bearer <token> header
+      - ?token=<token> query parameter
+
+    Returns user info dict when auth is required, None otherwise.
+    """
+    raw_token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        raw_token = authorization[7:]
+    elif token:
+        raw_token = token
+
+    if REQUIRE_AUTH:
+        if not raw_token:
+            raise HTTPException(status_code=401, detail="authentication required")
+        return await _validate_token(raw_token)
+
+    # Auth not required — still resolve user if token provided (best-effort)
+    if raw_token:
+        try:
+            return await _validate_token(raw_token)
+        except HTTPException:
+            return None
+    return None
+
+
+def _log_activity(
+    action: str,
+    *,
+    user: Optional[dict] = None,
+    session_id: Optional[str] = None,
+    model: Optional[str] = None,
+    language: Optional[str] = None,
+    chunks: Optional[int] = None,
+    file_size_bytes: Optional[int] = None,
+    processing_time_s: Optional[float] = None,
+    text_length: Optional[int] = None,
+    client_ip: Optional[str] = None,
+):
+    """Append a single JSON line to the activity log."""
+    entry: dict = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "action": action,
+    }
+    if user:
+        entry["user_id"] = user.get("id")
+        entry["user_email"] = user.get("email")
+    if client_ip:
+        entry["client_ip"] = client_ip
+    if session_id:
+        entry["session_id"] = session_id
+    if model:
+        entry["model"] = model
+    if language:
+        entry["language"] = language
+    if chunks is not None:
+        entry["chunks"] = chunks
+    if file_size_bytes is not None:
+        entry["file_size_bytes"] = file_size_bytes
+    if processing_time_s is not None:
+        entry["processing_time_s"] = processing_time_s
+    if text_length is not None:
+        entry["text_length"] = text_length
+    _activity_log.info(json.dumps(entry))
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +370,8 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def _shutdown():
     _transcription_executor.shutdown(wait=False)
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
 
 
 @app.get("/health")
@@ -253,13 +382,16 @@ async def health():
         "default_model": DEFAULT_MODEL_SIZE,
         "device": "apple-silicon-gpu" if USE_MLX else DEFAULT_DEVICE,
         "compute_type": "mlx-float16" if USE_MLX else DEFAULT_COMPUTE_TYPE,
+        "auth_required": REQUIRE_AUTH,
     }
 
 
 @app.post("/api/session/{session_id}/chunk")
 async def upload_chunk(
     session_id: str,
+    request: Request,
     chunk: UploadFile = File(...),
+    user: Optional[dict] = Depends(get_current_user),
 ):
     """Receive a single WAV chunk and append it to the session buffer."""
     _evict_stale_sessions()
@@ -277,6 +409,14 @@ async def upload_chunk(
         )
     chunks.append(audio_bytes)
     _sessions[session_id] = (time.monotonic(), chunks)
+    _log_activity(
+        "chunk_upload",
+        user=user,
+        session_id=session_id,
+        chunks=len(chunks),
+        file_size_bytes=total,
+        client_ip=request.client.host if request.client else None,
+    )
     return {
         "chunks": len(chunks),
         "total_bytes": total,
@@ -286,9 +426,11 @@ async def upload_chunk(
 @app.post("/api/session/{session_id}/transcribe")
 async def transcribe_session(
     session_id: str,
+    request: Request,
     model_size: str = DEFAULT_MODEL_SIZE,
     language: str = "auto",
     prompt: str = "",
+    user: Optional[dict] = Depends(get_current_user),
 ):
     """Concatenate all chunks for this session and transcribe as one audio."""
     if model_size not in ALLOWED_MODELS:
@@ -317,8 +459,21 @@ async def transcribe_session(
 
     elapsed = time.monotonic() - t0
     log.info(
-        "Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s)",
+        "Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
         num_chunks, file_size, elapsed, model_size, language,
+        (user or {}).get("email", "anonymous"),
+    )
+    _log_activity(
+        "transcribe",
+        user=user,
+        session_id=session_id,
+        model=model_size,
+        language=language,
+        chunks=num_chunks,
+        file_size_bytes=file_size,
+        processing_time_s=round(elapsed, 3),
+        text_length=len(text),
+        client_ip=request.client.host if request.client else None,
     )
     return {
         "text": text,
@@ -333,10 +488,12 @@ async def transcribe_session(
 
 @app.post("/api/transcribe")
 async def transcribe_audio(
+    request: Request,
     audio: UploadFile = File(...),
     model_size: str = Query(DEFAULT_MODEL_SIZE),
     language: str = Query("auto"),
     prompt: str = Query(""),
+    user: Optional[dict] = Depends(get_current_user),
 ):
     """Single-shot transcription: upload a complete audio file and get text back."""
     if model_size not in ALLOWED_MODELS:
@@ -372,8 +529,19 @@ async def transcribe_audio(
 
     elapsed = time.monotonic() - t0
     log.info(
-        "Transcribed single file (%d bytes) in %.2fs (model=%s, lang=%s)",
+        "Transcribed single file (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
         len(audio_bytes), elapsed, model_size, language,
+        (user or {}).get("email", "anonymous"),
+    )
+    _log_activity(
+        "transcribe",
+        user=user,
+        model=model_size,
+        language=language,
+        file_size_bytes=len(audio_bytes),
+        processing_time_s=round(elapsed, 3),
+        text_length=len(text),
+        client_ip=request.client.host if request.client else None,
     )
     return {
         "text": text,

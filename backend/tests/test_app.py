@@ -1,6 +1,10 @@
+import asyncio
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
 
+import whisper_streamer.main as main_module
 from whisper_streamer.main import app, _sessions
 
 
@@ -22,6 +26,7 @@ def test_health(client):
     data = resp.json()
     assert data["status"] == "ok"
     assert "backend" in data
+    assert "auth_required" in data
 
 
 def test_chunk_upload(client):
@@ -106,3 +111,43 @@ def test_single_shot_invalid_model(client):
     )
     assert resp.status_code == 400
     assert "invalid model_size" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Auth tests
+# ---------------------------------------------------------------------------
+def test_auth_required_rejects_without_token(client, monkeypatch):
+    """When REQUIRE_AUTH=true, requests without a token get 401."""
+    monkeypatch.setattr(main_module, "REQUIRE_AUTH", True)
+    resp = client.get("/api/session/nonexistent/transcribe")
+    # POST endpoints
+    wav = b"RIFF" + b"\x00" * 100
+    resp = client.post("/api/session/s1/chunk", files={"chunk": ("c.wav", wav, "audio/wav")})
+    assert resp.status_code == 401
+
+
+def test_auth_required_accepts_valid_token(client, monkeypatch):
+    """When REQUIRE_AUTH=true and a valid token is provided, request succeeds."""
+    monkeypatch.setattr(main_module, "REQUIRE_AUTH", True)
+    monkeypatch.setattr(
+        main_module, "_validate_token",
+        AsyncMock(return_value={"id": "test-user", "email": "test@example.com", "roles": []}),
+    )
+    wav = b"RIFF" + b"\x00" * 100
+    resp = client.post(
+        "/api/session/s1/chunk",
+        files={"chunk": ("c.wav", wav, "audio/wav")},
+        headers={"Authorization": "Bearer fake-token"},
+    )
+    assert resp.status_code == 200
+
+
+def test_auth_not_required_allows_anonymous(client, monkeypatch):
+    """When REQUIRE_AUTH=false, requests without tokens work fine."""
+    monkeypatch.setattr(main_module, "REQUIRE_AUTH", False)
+    wav = b"RIFF" + b"\x00" * 100
+    resp = client.post(
+        "/api/session/s1/chunk",
+        files={"chunk": ("c.wav", wav, "audio/wav")},
+    )
+    assert resp.status_code == 200

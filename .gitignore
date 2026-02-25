@@ -1,3 +1,9 @@
+# Secrets
+.env
+
+# Logs
+activity.jsonl
+
 # Python
 __pycache__/
 *.py[cod]
