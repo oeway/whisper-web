@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir ./backend[cpu]
 COPY frontend/ frontend/
 
 # Create non-root user and writable data directory
-RUN groupadd -r whisper && useradd -r -g whisper -u 1000 whisper && \
+RUN groupadd -r whisper && useradd -r -g whisper -u 1000 -m whisper && \
     mkdir -p /data && chown whisper:whisper /data
 
 ENV WHISPER_ACTIVITY_LOG=/data/activity.jsonl \
