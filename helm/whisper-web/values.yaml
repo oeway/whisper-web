@@ -1,0 +1,54 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/oeway/whisper-web
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: 100m
+  host: whisper.hypha.aicell.io
+  tls:
+    secretName: whisper.hypha.aicell.io-tls
+
+env:
+  WHISPER_MODEL_SIZE: "small"
+  WHISPER_DEVICE: "cpu"
+  WHISPER_COMPUTE_TYPE: "float32"
+  WHISPER_MAX_WORKERS: "2"
+  WHISPER_REQUIRE_AUTH: "true"
+  HYPHA_TOKEN_URL: "https://hypha.aicell.io/public/services/ws/parse_token"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 2000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "4"
+    memory: 4Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
