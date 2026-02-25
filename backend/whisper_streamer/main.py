@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile, Query, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -372,6 +373,12 @@ async def _shutdown():
     _transcription_executor.shutdown(wait=False)
     if _http_client and not _http_client.is_closed:
         await _http_client.aclose()
+
+
+@app.get("/sdk")
+async def sdk_info():
+    """Redirect to the SDK entry point or return SDK metadata."""
+    return RedirectResponse(url="/whisper-client.js")
 
 
 @app.get("/health")

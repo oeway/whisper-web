@@ -12,8 +12,11 @@
     .loading-dot { animation: blink-dot 1s infinite; }
   </style>
 </head>
-<body class="min-h-screen bg-slate-950 text-slate-50 flex items-center justify-center p-6">
+<body class="min-h-screen bg-slate-950 text-slate-50 flex flex-col items-center p-6 gap-8">
   <div class="w-full max-w-3xl bg-slate-900/70 border border-slate-800 rounded-3xl shadow-2xl p-6 space-y-6">
+    <div id="authBanner" class="hidden bg-red-900/60 border border-red-700 rounded-xl p-4 text-sm text-red-200">
+      <strong>Authentication required.</strong> Pass your Hypha token in the URL: <code class="bg-red-950 px-1 rounded">?token=YOUR_TOKEN</code>
+    </div>
     <header class="flex items-center justify-between gap-4">
       <div>
         <p class="text-sm uppercase tracking-[0.25em] text-emerald-300">Whisper</p>
@@ -83,7 +86,39 @@
     </div>
   </div>
 
-<script>
+  <!-- Developer SDK Section -->
+  <div class="w-full max-w-3xl bg-slate-900/70 border border-slate-800 rounded-3xl shadow-2xl p-6 space-y-4">
+    <header>
+      <p class="text-sm uppercase tracking-[0.25em] text-cyan-300">Developer</p>
+      <h2 class="text-xl font-semibold">SDK Usage</h2>
+      <p class="text-slate-400 text-sm">Import <code class="bg-slate-800 px-1.5 py-0.5 rounded text-emerald-300">WhisperClient</code> into your own app — no build step required.</p>
+    </header>
+    <pre class="bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-300 overflow-x-auto"><code><span class="text-cyan-300">import</span> { WhisperClient } <span class="text-cyan-300">from</span> <span class="text-emerald-300">'/whisper-client.js'</span>;
+
+<span class="text-slate-500">// Create a client</span>
+<span class="text-cyan-300">const</span> client = <span class="text-cyan-300">new</span> WhisperClient({
+  server: window.location.origin,  <span class="text-slate-500">// default: same origin</span>
+  token:  <span class="text-emerald-300">'your-hypha-token'</span>,   <span class="text-slate-500">// optional</span>
+  model:  <span class="text-emerald-300">'small'</span>,               <span class="text-slate-500">// tiny | base | small | medium | large-v3</span>
+});
+
+<span class="text-slate-500">// Option A: Record from microphone with VAD</span>
+client.onChunkUploaded = (info) => console.log(info.chunks, info.totalBytes);
+<span class="text-cyan-300">await</span> client.startRecording();
+<span class="text-cyan-300">const</span> result = <span class="text-cyan-300">await</span> client.stopRecording();
+console.log(result.text);
+
+<span class="text-slate-500">// Option B: Transcribe an audio file directly</span>
+<span class="text-cyan-300">const</span> result2 = <span class="text-cyan-300">await</span> client.transcribe(audioBlob);
+
+<span class="text-slate-500">// Cleanup when done</span>
+client.destroy();</code></pre>
+    <p class="text-xs text-slate-500">TypeScript types: <code class="bg-slate-800 px-1.5 py-0.5 rounded">/whisper-client.d.ts</code></p>
+  </div>
+
+<script type="module">
+import { WhisperClient } from '/whisper-client.js';
+
 // ---- DOM refs ----
 const micBtn     = document.getElementById('micBtn');
 const micIcon    = document.getElementById('micIcon');
@@ -104,39 +139,51 @@ const statChunks     = document.getElementById('statChunks');
 const statFileSize   = document.getElementById('statFileSize');
 const statProcessTime = document.getElementById('statProcessTime');
 const statModel      = document.getElementById('statModel');
+const authBanner = document.getElementById('authBanner');
+
+const urlToken = new URLSearchParams(window.location.search).get('token') || '';
+
+// ---- SDK client ----
+const client = new WhisperClient({
+  token: urlToken,
+  model: modelSelect.value,
+  language: langSelect.value,
+  prompt: promptInput.value,
+});
+
+// ---- Auth check on load ----
+(async () => {
+  try {
+    const data = await client.getHealth();
+    if (data.auth_required && !urlToken) {
+      authBanner.classList.remove('hidden');
+      micBtn.disabled = true;
+      micBtn.style.opacity = 0.4;
+      statusText.textContent = 'Authentication required to use this service.';
+      return;
+    }
+    if (data.auth_required && urlToken) {
+      const testResp = await fetch('/api/session/_auth_check/chunk', {
+        method: 'POST',
+        headers: urlToken ? { 'Authorization': `Bearer ${urlToken}` } : {},
+        body: (() => { const fd = new FormData(); fd.append('chunk', new Blob([new Uint8Array(0)]), 'empty.wav'); return fd; })(),
+      });
+      if (testResp.status === 401) {
+        authBanner.innerHTML = '<strong>Invalid or expired token.</strong> Please provide a valid Hypha token in the URL.';
+        authBanner.classList.remove('hidden');
+        micBtn.disabled = true;
+        micBtn.style.opacity = 0.4;
+        statusText.textContent = 'Authentication failed.';
+      }
+    }
+  } catch (_) {}
+})();
 
 // ---- State ----
-let isRecording = false;
 let isTranscribing = false;
-let sessionId = null;
-let mediaStream = null;
-let audioCtx = null;
-let sourceNode = null;
-let processorNode = null;
-let chunkTimer = null;
 let timerInterval = null;
 let recordStart = 0;
 let recordDurationS = 0;
-
-// PCM accumulator (between flushes)
-let pcmBuffers = [];
-let pcmLength = 0;
-
-// VAD state
-let speaking = false;
-let lastSpeech = 0;
-let noiseFloor = 0.004;
-let vadWarmupUntil = 0;
-let silentStreak = 0;
-
-// Chunk upload tracking
-let chunksSent = 0;
-let totalBytesSent = 0;
-
-// VAD tuning
-const CHUNK_MS = 1500;
-const VAD_THRESHOLD = 0.012;
-const VAD_HANGOVER_MS = 800;
 
 // ---- UI helpers ----
 function setRecordingUI(active) {
@@ -155,215 +202,10 @@ function updateTimer() {
   timerEl.textContent = `${m}:${s}`;
 }
 
-function updateChunkInfo() {
-  chunkInfo.classList.remove('hidden');
-  chunkInfo.textContent = `${chunksSent} chunks sent · ${formatBytes(totalBytesSent)} uploaded`;
-}
-
 function formatBytes(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-}
-
-// ---- WAV encoding ----
-function encodeWav(samples, sampleRate) {
-  const bytesPerSample = 2;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const v = new DataView(buffer);
-  const w = (off, str) => { for (let i = 0; i < str.length; i++) v.setUint8(off + i, str.charCodeAt(i)); };
-  w(0, 'RIFF');
-  v.setUint32(4, 36 + dataSize, true);
-  w(8, 'WAVE');
-  w(12, 'fmt ');
-  v.setUint32(16, 16, true);
-  v.setUint16(20, 1, true);
-  v.setUint16(22, 1, true);
-  v.setUint32(24, sampleRate, true);
-  v.setUint32(28, sampleRate * bytesPerSample, true);
-  v.setUint16(32, bytesPerSample, true);
-  v.setUint16(34, 16, true);
-  w(36, 'data');
-  v.setUint32(40, dataSize, true);
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-  return new Blob([v], { type: 'audio/wav' });
-}
-
-function mergeBuffers(buffers, length) {
-  const out = new Float32Array(length);
-  let off = 0;
-  for (const b of buffers) { out.set(b, off); off += b.length; }
-  return out;
-}
-
-// ---- Chunk flushing with VAD ----
-async function flushChunk(force = false) {
-  if (pcmLength === 0 || !audioCtx) return;
-  const now = performance.now();
-  const inWarmup = now < vadWarmupUntil;
-  const active = force || inWarmup || speaking || (now - lastSpeech < VAD_HANGOVER_MS);
-
-  const merged = mergeBuffers(pcmBuffers, pcmLength);
-  pcmBuffers = [];
-  pcmLength = 0;
-
-  if (!active) {
-    silentStreak += 1;
-    return; // skip silent chunk
-  }
-  silentStreak = 0;
-
-  const wavBlob = encodeWav(merged, audioCtx.sampleRate);
-  if (wavBlob.size < 1200) return; // too tiny
-
-  // Upload chunk to session buffer on backend
-  const form = new FormData();
-  form.append('chunk', wavBlob, 'chunk.wav');
-  try {
-    const resp = await fetch(`/api/session/${sessionId}/chunk`, { method: 'POST', body: form });
-    if (resp.ok) {
-      chunksSent += 1;
-      totalBytesSent += wavBlob.size;
-      updateChunkInfo();
-    }
-  } catch (e) {
-    // Network error — non-fatal, chunk is lost but recording continues
-  }
-}
-
-// ---- Recording ----
-async function startRecording() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    statusText.textContent = 'Mic not available in this browser.';
-    return;
-  }
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (e) {
-    statusText.textContent = 'Mic permission denied.';
-    return;
-  }
-
-  sessionId = crypto.randomUUID();
-  chunksSent = 0;
-  totalBytesSent = 0;
-
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-  processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
-  const muteNode = audioCtx.createGain();
-  muteNode.gain.value = 0;
-  sourceNode.connect(processorNode);
-  processorNode.connect(muteNode);
-  muteNode.connect(audioCtx.destination);
-  await audioCtx.resume();
-
-  pcmBuffers = [];
-  pcmLength = 0;
-  speaking = false;
-  lastSpeech = 0;
-  noiseFloor = 0.004;
-  silentStreak = 0;
-  vadWarmupUntil = performance.now() + 3000; // send first 3s unconditionally
-
-  processorNode.onaudioprocess = (e) => {
-    if (!isRecording) return;
-    const input = e.inputBuffer.getChannelData(0);
-
-    // VAD: compute RMS and update adaptive noise floor
-    let sum = 0;
-    for (let i = 0; i < input.length; i++) { sum += input[i] * input[i]; }
-    const rms = Math.sqrt(sum / input.length);
-    noiseFloor = 0.97 * noiseFloor + 0.03 * Math.min(rms, noiseFloor * 3);
-    const threshold = Math.max(VAD_THRESHOLD * 0.35, noiseFloor * 2.2);
-    speaking = rms > threshold;
-    if (speaking) lastSpeech = performance.now();
-
-    const copy = new Float32Array(input.length);
-    copy.set(input);
-    pcmBuffers.push(copy);
-    pcmLength += copy.length;
-  };
-
-  // Flush chunks periodically
-  chunkTimer = setInterval(() => flushChunk(false), CHUNK_MS);
-
-  isRecording = true;
-  recordStart = Date.now();
-  timerInterval = setInterval(updateTimer, 500);
-  updateTimer();
-  setRecordingUI(true);
-  statusText.textContent = 'Recording... Click to stop.';
-  transcriptEl.textContent = '';
-  statsEl.classList.add('hidden');
-  chunkInfo.classList.add('hidden');
-}
-
-async function stopRecording() {
-  isRecording = false;
-  clearInterval(timerInterval);
-  clearInterval(chunkTimer);
-  recordDurationS = (Date.now() - recordStart) / 1000;
-
-  // Flush any remaining audio
-  if (pcmLength > 0 && audioCtx) {
-    await flushChunk(true);
-  }
-
-  if (processorNode) processorNode.disconnect();
-  if (sourceNode) sourceNode.disconnect();
-  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-  if (audioCtx) { audioCtx.close(); audioCtx = null; }
-
-  setRecordingUI(false);
-
-  if (chunksSent === 0) {
-    statusText.textContent = 'No speech detected. Try again.';
-    return;
-  }
-
-  // Trigger server-side transcription of all accumulated chunks
-  await transcribeSession();
-}
-
-async function transcribeSession() {
-  isTranscribing = true;
-  micBtn.disabled = true;
-  micBtn.style.opacity = 0.5;
-  statusText.textContent = 'Transcribing...';
-  loadingRow.classList.remove('hidden');
-
-  const params = new URLSearchParams({
-    model_size: modelSelect.value,
-    language: langSelect.value,
-    prompt: promptInput.value,
-  });
-
-  try {
-    const resp = await fetch(`/api/session/${sessionId}/transcribe?${params}`, { method: 'POST' });
-    if (!resp.ok) {
-      const err = await resp.text();
-      transcriptEl.textContent = `Error: ${err}`;
-    } else {
-      const data = await resp.json();
-      transcriptEl.textContent = data.text || '(no speech detected)';
-      showStats(data);
-    }
-  } catch (e) {
-    transcriptEl.textContent = `Network error: ${e.message}`;
-  } finally {
-    isTranscribing = false;
-    micBtn.disabled = false;
-    micBtn.style.opacity = 1;
-    micBtn.style.background = '';
-    loadingRow.classList.add('hidden');
-    statusText.textContent = 'Done. Click mic to record again.';
-    statusDot.style.backgroundColor = '#34d399';
-  }
 }
 
 function showStats(data) {
@@ -377,13 +219,71 @@ function showStats(data) {
   statsEl.classList.remove('hidden');
 }
 
+// ---- Chunk upload callback ----
+client.onChunkUploaded = (info) => {
+  chunkInfo.classList.remove('hidden');
+  chunkInfo.textContent = `${info.chunks} chunks sent · ${formatBytes(info.totalBytes)} uploaded`;
+};
+
 // ---- Button ----
-micBtn.addEventListener('click', () => {
+micBtn.addEventListener('click', async () => {
   if (isTranscribing) return;
-  if (isRecording) {
-    stopRecording();
+
+  if (client.recording) {
+    // Stop
+    clearInterval(timerInterval);
+    recordDurationS = (Date.now() - recordStart) / 1000;
+    setRecordingUI(false);
+
+    if (client._chunksSent === 0 && client._pcmLength === 0) {
+      statusText.textContent = 'No speech detected. Try again.';
+    }
+
+    isTranscribing = true;
+    micBtn.disabled = true;
+    micBtn.style.opacity = 0.5;
+    statusText.textContent = 'Transcribing...';
+    loadingRow.classList.remove('hidden');
+
+    try {
+      const result = await client.stopRecording();
+      if (result.text) {
+        transcriptEl.textContent = result.text;
+        showStats(result);
+      } else {
+        transcriptEl.textContent = '(no speech detected)';
+      }
+    } catch (e) {
+      transcriptEl.textContent = `Error: ${e.message}`;
+    } finally {
+      isTranscribing = false;
+      micBtn.disabled = false;
+      micBtn.style.opacity = 1;
+      micBtn.style.background = '';
+      loadingRow.classList.add('hidden');
+      statusText.textContent = 'Done. Click mic to record again.';
+      statusDot.style.backgroundColor = '#34d399';
+    }
   } else {
-    startRecording();
+    // Start — sync options from UI before starting
+    client.model = modelSelect.value;
+    client.language = langSelect.value;
+    client.prompt = promptInput.value;
+
+    try {
+      await client.startRecording();
+    } catch (e) {
+      statusText.textContent = e.message;
+      return;
+    }
+    recordStart = Date.now();
+    timerInterval = setInterval(updateTimer, 500);
+    updateTimer();
+    setRecordingUI(true);
+    statusText.textContent = 'Recording... Click to stop.';
+    transcriptEl.textContent = '';
+    statsEl.classList.add('hidden');
+    chunkInfo.classList.add('hidden');
   }
 });
 </script>
