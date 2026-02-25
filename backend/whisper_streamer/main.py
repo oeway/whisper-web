@@ -8,9 +8,9 @@ import time
 import logging
 import concurrent.futures
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -46,6 +46,9 @@ DEFAULT_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
 DEFAULT_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 DEFAULT_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float32")
 ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
+MAX_CHUNK_BYTES = int(os.getenv("WHISPER_MAX_CHUNK_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+MAX_WORKERS = int(os.getenv("WHISPER_MAX_WORKERS", "2"))
+SESSION_TTL_SECONDS = int(os.getenv("WHISPER_SESSION_TTL", "600"))  # 10 minutes
 
 MLX_MODEL_MAP = {
     "tiny": "mlx-community/whisper-tiny-mlx",
@@ -55,13 +58,30 @@ MLX_MODEL_MAP = {
     "large-v3": "mlx-community/whisper-large-v3-mlx",
 }
 
-# Single worker thread so transcription calls are serialised.
+# Transcription thread pool — configurable via WHISPER_MAX_WORKERS.
+# MLX is single-threaded (GPU), so we default to 2 but only 1 runs at a time on MLX.
+# faster-whisper on CUDA can benefit from 2+ workers if GPU memory allows.
 _transcription_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="whisper"
+    max_workers=MAX_WORKERS, thread_name_prefix="whisper"
 )
 
-# In-memory session store: session_id -> list of raw WAV bytes
-_sessions: Dict[str, List[bytes]] = {}
+# In-memory session store: session_id -> (last_updated_timestamp, chunks)
+_sessions: Dict[str, Tuple[float, List[bytes]]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Session cleanup
+# ---------------------------------------------------------------------------
+def _evict_stale_sessions() -> int:
+    """Remove sessions older than SESSION_TTL_SECONDS. Returns count evicted."""
+    now = time.monotonic()
+    stale = [sid for sid, (ts, _) in _sessions.items()
+             if now - ts > SESSION_TTL_SECONDS]
+    for sid in stale:
+        del _sessions[sid]
+    if stale:
+        log.info("Evicted %d stale session(s): %s", len(stale), stale)
+    return len(stale)
 
 
 # ---------------------------------------------------------------------------
@@ -242,15 +262,23 @@ async def upload_chunk(
     chunk: UploadFile = File(...),
 ):
     """Receive a single WAV chunk and append it to the session buffer."""
+    _evict_stale_sessions()
     audio_bytes = await chunk.read()
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="empty chunk")
     if session_id not in _sessions:
-        _sessions[session_id] = []
-    _sessions[session_id].append(audio_bytes)
-    total = sum(len(c) for c in _sessions[session_id])
+        _sessions[session_id] = (time.monotonic(), [])
+    ts, chunks = _sessions[session_id]
+    total = sum(len(c) for c in chunks) + len(audio_bytes)
+    if total > MAX_CHUNK_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"session exceeds max size ({MAX_CHUNK_BYTES} bytes)",
+        )
+    chunks.append(audio_bytes)
+    _sessions[session_id] = (time.monotonic(), chunks)
     return {
-        "chunks": len(_sessions[session_id]),
+        "chunks": len(chunks),
         "total_bytes": total,
     }
 
@@ -263,9 +291,15 @@ async def transcribe_session(
     prompt: str = "",
 ):
     """Concatenate all chunks for this session and transcribe as one audio."""
-    chunks = _sessions.pop(session_id, [])
-    if not chunks:
+    if model_size not in ALLOWED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid model_size '{model_size}', must be one of {sorted(ALLOWED_MODELS)}",
+        )
+    entry = _sessions.pop(session_id, None)
+    if entry is None:
         raise HTTPException(status_code=404, detail="no audio for this session")
+    _, chunks = entry
 
     combined = _concat_wav_chunks(chunks)
     file_size = len(combined)
@@ -295,6 +329,72 @@ async def transcribe_session(
         "language": language,
         "prompt": prompt,
     }
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(
+    audio: UploadFile = File(...),
+    model_size: str = Query(DEFAULT_MODEL_SIZE),
+    language: str = Query("auto"),
+    prompt: str = Query(""),
+):
+    """Single-shot transcription: upload a complete audio file and get text back."""
+    if model_size not in ALLOWED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid model_size '{model_size}', must be one of {sorted(ALLOWED_MODELS)}",
+        )
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="empty audio file")
+    if len(audio_bytes) > MAX_CHUNK_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file exceeds max size ({MAX_CHUNK_BYTES} bytes)",
+        )
+
+    # Guess suffix from content type or filename
+    suffix = ".wav"
+    if audio.content_type and "webm" in audio.content_type:
+        suffix = ".webm"
+    elif audio.filename and "." in audio.filename:
+        suffix = "." + audio.filename.rsplit(".", 1)[-1]
+
+    model_or_repo = await model_pool.get(model_size)
+    t0 = time.monotonic()
+
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(
+        _transcription_executor,
+        transcribe_bytes,
+        model_or_repo, audio_bytes, suffix, language, prompt,
+    )
+
+    elapsed = time.monotonic() - t0
+    log.info(
+        "Transcribed single file (%d bytes) in %.2fs (model=%s, lang=%s)",
+        len(audio_bytes), elapsed, model_size, language,
+    )
+    return {
+        "text": text,
+        "file_size_bytes": len(audio_bytes),
+        "processing_time_s": round(elapsed, 3),
+        "model": model_size,
+        "language": language,
+        "prompt": prompt,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Periodic session cleanup
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+async def _start_session_cleanup():
+    async def _cleanup_loop():
+        while True:
+            await asyncio.sleep(SESSION_TTL_SECONDS / 2)
+            _evict_stale_sessions()
+    asyncio.create_task(_cleanup_loop())
 
 
 if FRONTEND_DIR.exists():

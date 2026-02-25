@@ -45,6 +45,12 @@ def test_transcribe_no_session(client):
     assert resp.status_code == 404
 
 
+def test_transcribe_invalid_model(client):
+    resp = client.post("/api/session/nonexistent/transcribe?model_size=bogus")
+    assert resp.status_code == 400
+    assert "invalid model_size" in resp.json()["detail"]
+
+
 def test_transcribe_returns_stats(client, monkeypatch):
     monkeypatch.setattr(
         "whisper_streamer.main.transcribe_bytes",
@@ -64,3 +70,39 @@ def test_transcribe_returns_stats(client, monkeypatch):
     assert "processing_time_s" in data
     assert data["model"] == "tiny"
     assert data["prompt"] == "test"
+
+
+def test_single_shot_transcribe(client, monkeypatch):
+    monkeypatch.setattr(
+        "whisper_streamer.main.transcribe_bytes",
+        lambda *args, **kwargs: "single shot",
+    )
+    wav = b"RIFF" + b"\x00" * 100
+    resp = client.post(
+        "/api/transcribe?model_size=tiny&language=en",
+        files={"audio": ("test.wav", wav, "audio/wav")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "single shot"
+    assert data["model"] == "tiny"
+    assert "file_size_bytes" in data
+    assert "processing_time_s" in data
+
+
+def test_single_shot_empty(client):
+    resp = client.post(
+        "/api/transcribe?model_size=tiny",
+        files={"audio": ("test.wav", b"", "audio/wav")},
+    )
+    assert resp.status_code == 400
+
+
+def test_single_shot_invalid_model(client):
+    wav = b"RIFF" + b"\x00" * 100
+    resp = client.post(
+        "/api/transcribe?model_size=invalid",
+        files={"audio": ("test.wav", wav, "audio/wav")},
+    )
+    assert resp.status_code == 400
+    assert "invalid model_size" in resp.json()["detail"]
