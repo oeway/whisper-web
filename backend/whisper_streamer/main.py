@@ -275,6 +275,31 @@ class ModelPool:
         self._compute_type = compute_type
         self._models: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
+        self._ready = False  # True once default model is loaded
+        self._load_error: Optional[str] = None
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    @property
+    def load_error(self) -> Optional[str]:
+        return self._load_error
+
+    @property
+    def loaded_models(self) -> list:
+        return list(self._models.keys())
+
+    async def preload(self, model_size: str):
+        """Pre-load a model at startup so it's ready for the first request."""
+        try:
+            await self.get(model_size)
+            self._ready = True
+            log.info("Model '%s' preloaded — service is ready", model_size)
+        except Exception as exc:
+            self._load_error = str(exc)
+            log.error("Failed to preload model '%s': %s", model_size, exc)
+            raise
 
     async def get(self, model_size: str):
         if model_size not in ALLOWED_MODELS:
@@ -383,13 +408,43 @@ async def sdk_info():
 
 @app.get("/health")
 async def health():
+    ready = model_pool.is_ready
     return {
-        "status": "ok",
+        "status": "ready" if ready else "loading",
         "backend": "mlx-whisper" if USE_MLX else "faster-whisper",
         "default_model": DEFAULT_MODEL_SIZE,
+        "loaded_models": model_pool.loaded_models,
         "device": "apple-silicon-gpu" if USE_MLX else DEFAULT_DEVICE,
         "compute_type": "mlx-float16" if USE_MLX else DEFAULT_COMPUTE_TYPE,
         "auth_required": REQUIRE_AUTH,
+    }
+
+
+@app.get("/health/liveness")
+async def liveness():
+    """Liveness probe: is the process alive and can the executor accept work?"""
+    try:
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(_transcription_executor, lambda: True),
+            timeout=5.0,
+        )
+    except Exception:
+        raise HTTPException(status_code=503, detail="executor unresponsive")
+    return {"status": "alive"}
+
+
+@app.get("/health/readiness")
+async def readiness():
+    """Readiness probe: is the default model loaded and ready to serve?"""
+    if not model_pool.is_ready:
+        raise HTTPException(
+            status_code=503,
+            detail=model_pool.load_error or "model not loaded yet",
+        )
+    return {
+        "status": "ready",
+        "loaded_models": model_pool.loaded_models,
     }
 
 
@@ -564,7 +619,12 @@ async def transcribe_audio(
 # Periodic session cleanup
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
-async def _start_session_cleanup():
+async def _startup():
+    # Pre-load the default model so it's ready for the first request
+    log.info("Preloading default model '%s' ...", DEFAULT_MODEL_SIZE)
+    await model_pool.preload(DEFAULT_MODEL_SIZE)
+
+    # Periodic session cleanup
     async def _cleanup_loop():
         while True:
             await asyncio.sleep(SESSION_TTL_SECONDS / 2)
