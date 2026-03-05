@@ -21,7 +21,7 @@
       <div>
         <p class="text-sm uppercase tracking-[0.25em] text-emerald-300">Whisper</p>
         <h1 class="text-2xl font-semibold">Voice Transcription</h1>
-        <p class="text-slate-400 text-sm">VAD-filtered recording with batch transcription</p>
+        <p id="modeDesc" class="text-slate-400 text-sm">VAD-filtered recording with batch transcription</p>
       </div>
       <div class="flex flex-col gap-2 text-sm">
         <select id="modelSelect" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-400">
@@ -41,6 +41,14 @@
           <option value="ja">Japanese</option>
           <option value="zh">Chinese</option>
         </select>
+        <label class="flex items-center gap-2 cursor-pointer select-none">
+          <div class="relative">
+            <input type="checkbox" id="streamToggle" class="sr-only peer" />
+            <div class="w-10 h-5 bg-slate-700 peer-checked:bg-emerald-500 rounded-full transition-colors"></div>
+            <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-5"></div>
+          </div>
+          <span class="text-slate-300">Live stream</span>
+        </label>
       </div>
     </header>
 
@@ -77,6 +85,9 @@
           <span id="statModel"></span>
         </div>
       </div>
+      <!-- Live streaming: individual utterances appear here as they arrive -->
+      <div id="streamLines" class="hidden space-y-1"></div>
+      <!-- Batch mode (or final result): single text block -->
       <div id="transcript" class="min-h-[160px] leading-relaxed text-lg font-medium text-slate-100 whitespace-pre-wrap"></div>
     </div>
 
@@ -120,25 +131,28 @@ client.destroy();</code></pre>
 import { WhisperClient } from '/whisper-client.js';
 
 // ---- DOM refs ----
-const micBtn     = document.getElementById('micBtn');
-const micIcon    = document.getElementById('micIcon');
-const stopIcon   = document.getElementById('stopIcon');
-const micRing    = document.getElementById('micRing');
-const statusDot  = document.getElementById('statusDot');
-const statusText = document.getElementById('statusText');
-const timerEl    = document.getElementById('timer');
-const chunkInfo  = document.getElementById('chunkInfo');
-const loadingRow = document.getElementById('loadingRow');
-const transcriptEl = document.getElementById('transcript');
-const modelSelect  = document.getElementById('modelSelect');
-const langSelect   = document.getElementById('langSelect');
-const promptInput  = document.getElementById('prompt');
-const statsEl        = document.getElementById('stats');
-const statDuration   = document.getElementById('statDuration');
-const statChunks     = document.getElementById('statChunks');
-const statFileSize   = document.getElementById('statFileSize');
+const micBtn      = document.getElementById('micBtn');
+const micIcon     = document.getElementById('micIcon');
+const stopIcon    = document.getElementById('stopIcon');
+const micRing     = document.getElementById('micRing');
+const statusDot   = document.getElementById('statusDot');
+const statusText  = document.getElementById('statusText');
+const modeDesc    = document.getElementById('modeDesc');
+const timerEl     = document.getElementById('timer');
+const chunkInfo   = document.getElementById('chunkInfo');
+const loadingRow  = document.getElementById('loadingRow');
+const transcriptEl  = document.getElementById('transcript');
+const streamLines   = document.getElementById('streamLines');
+const modelSelect   = document.getElementById('modelSelect');
+const langSelect    = document.getElementById('langSelect');
+const promptInput   = document.getElementById('prompt');
+const streamToggle  = document.getElementById('streamToggle');
+const statsEl         = document.getElementById('stats');
+const statDuration    = document.getElementById('statDuration');
+const statChunks      = document.getElementById('statChunks');
+const statFileSize    = document.getElementById('statFileSize');
 const statProcessTime = document.getElementById('statProcessTime');
-const statModel      = document.getElementById('statModel');
+const statModel       = document.getElementById('statModel');
 const authBanner = document.getElementById('authBanner');
 
 const urlToken = new URLSearchParams(window.location.search).get('token') || '';
@@ -179,6 +193,13 @@ const client = new WhisperClient({
   } catch (_) {}
 })();
 
+// ---- Mode toggle ----
+streamToggle.addEventListener('change', () => {
+  modeDesc.textContent = streamToggle.checked
+    ? 'Live streaming — transcript appears sentence by sentence'
+    : 'VAD-filtered recording with batch transcription';
+});
+
 // ---- State ----
 let isTranscribing = false;
 let timerInterval = null;
@@ -210,16 +231,30 @@ function formatBytes(bytes) {
 
 function showStats(data) {
   const dur = recordDurationS.toFixed(1);
-  const speed = (recordDurationS / data.processing_time_s).toFixed(1);
   statDuration.textContent = `duration: ${dur}s`;
-  statChunks.textContent = `chunks: ${data.chunks}`;
-  statFileSize.textContent = `audio: ${formatBytes(data.file_size_bytes)}`;
-  statProcessTime.textContent = `transcribe: ${data.processing_time_s.toFixed(2)}s (${speed}x RT)`;
-  statModel.textContent = `model: ${data.model}`;
+  if (data.chunks != null) statChunks.textContent = `chunks: ${data.chunks}`;
+  if (data.file_size_bytes != null) statFileSize.textContent = `audio: ${formatBytes(data.file_size_bytes)}`;
+  if (data.processing_time_s != null) {
+    const speed = recordDurationS > 0 ? (recordDurationS / data.processing_time_s).toFixed(1) : '—';
+    statProcessTime.textContent = `transcribe: ${data.processing_time_s.toFixed(2)}s (${speed}x RT)`;
+  }
+  if (data.model) statModel.textContent = `model: ${data.model}`;
   statsEl.classList.remove('hidden');
 }
 
-// ---- Chunk upload callback ----
+// ---- Streaming helpers ----
+function addStreamLine(text, seq, processingTime) {
+  const line = document.createElement('div');
+  line.className = 'flex gap-2 items-start';
+  line.innerHTML = `
+    <span class="text-xs text-slate-500 font-mono mt-1 shrink-0">[${seq}]</span>
+    <span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>
+    <span class="text-xs text-slate-600 font-mono mt-1 ml-auto shrink-0">${processingTime.toFixed(2)}s</span>`;
+  streamLines.appendChild(line);
+  streamLines.scrollTop = streamLines.scrollHeight;
+}
+
+// ---- Chunk upload callback (batch mode) ----
 client.onChunkUploaded = (info) => {
   chunkInfo.classList.remove('hidden');
   chunkInfo.textContent = `${info.chunks} chunks sent · ${formatBytes(info.totalBytes)} uploaded`;
@@ -228,64 +263,138 @@ client.onChunkUploaded = (info) => {
 // ---- Button ----
 micBtn.addEventListener('click', async () => {
   if (isTranscribing) return;
+  const isStreaming = streamToggle.checked;
 
-  if (client.recording) {
-    // Stop
+  if (client.recording || client.streaming) {
+    // ---- STOP ----
     clearInterval(timerInterval);
     recordDurationS = (Date.now() - recordStart) / 1000;
     setRecordingUI(false);
-
-    if (client._chunksSent === 0 && client._pcmLength === 0) {
-      statusText.textContent = 'No speech detected. Try again.';
-    }
-
-    isTranscribing = true;
     micBtn.disabled = true;
     micBtn.style.opacity = 0.5;
-    statusText.textContent = 'Transcribing...';
-    loadingRow.classList.remove('hidden');
 
-    try {
-      const result = await client.stopRecording();
-      if (result.text) {
-        transcriptEl.textContent = result.text;
-        showStats(result);
-      } else {
-        transcriptEl.textContent = '(no speech detected)';
+    if (isStreaming) {
+      statusText.textContent = 'Finishing last utterance...';
+      loadingRow.classList.remove('hidden');
+      try {
+        const result = await client.stopStreaming();
+        statusText.textContent = `Done — ${result.utterances} utterance(s). Click mic to record again.`;
+        statusDot.style.backgroundColor = '#34d399';
+        // Show full accumulated text in main transcript block too
+        if (result.text) {
+          transcriptEl.textContent = result.text;
+          showStats({ processing_time_s: 0, model: client.model });
+        }
+      } catch (e) {
+        transcriptEl.textContent = `Error: ${e.message}`;
+      } finally {
+        loadingRow.classList.add('hidden');
+        micBtn.disabled = false;
+        micBtn.style.opacity = 1;
+        micBtn.style.background = '';
+        streamToggle.disabled = false;
       }
-    } catch (e) {
-      transcriptEl.textContent = `Error: ${e.message}`;
-    } finally {
-      isTranscribing = false;
-      micBtn.disabled = false;
-      micBtn.style.opacity = 1;
-      micBtn.style.background = '';
-      loadingRow.classList.add('hidden');
-      statusText.textContent = 'Done. Click mic to record again.';
-      statusDot.style.backgroundColor = '#34d399';
+    } else {
+      // Batch mode
+      if (client._chunksSent === 0 && client._pcmLength === 0) {
+        statusText.textContent = 'No speech detected. Try again.';
+        micBtn.disabled = false;
+        micBtn.style.opacity = 1;
+        micBtn.style.background = '';
+        return;
+      }
+      isTranscribing = true;
+      statusText.textContent = 'Transcribing...';
+      loadingRow.classList.remove('hidden');
+      try {
+        const result = await client.stopRecording();
+        if (result.text) {
+          transcriptEl.textContent = result.text;
+          showStats(result);
+        } else {
+          transcriptEl.textContent = '(no speech detected)';
+        }
+      } catch (e) {
+        transcriptEl.textContent = `Error: ${e.message}`;
+      } finally {
+        isTranscribing = false;
+        micBtn.disabled = false;
+        micBtn.style.opacity = 1;
+        micBtn.style.background = '';
+        loadingRow.classList.add('hidden');
+        statusText.textContent = 'Done. Click mic to record again.';
+        statusDot.style.backgroundColor = '#34d399';
+        streamToggle.disabled = false;
+      }
     }
   } else {
-    // Start — sync options from UI before starting
+    // ---- START ----
     client.model = modelSelect.value;
     client.language = langSelect.value;
     client.prompt = promptInput.value;
 
-    try {
-      await client.startRecording();
-    } catch (e) {
-      statusText.textContent = e.message;
-      return;
+    // Reset transcript area
+    transcriptEl.textContent = '';
+    streamLines.innerHTML = '';
+    statsEl.classList.add('hidden');
+    chunkInfo.classList.add('hidden');
+
+    if (isStreaming) {
+      // Show live stream lines, hide batch block
+      streamLines.classList.remove('hidden');
+      transcriptEl.classList.add('hidden');
+
+      // Wire up live transcript callback
+      client.onTranscript = (r) => {
+        const text = (r.text || '').trim();
+        if (r.error) {
+          // Show error inline in the stream as a dim red line
+          const errLine = document.createElement('div');
+          errLine.className = 'flex gap-2 items-start';
+          errLine.innerHTML = `<span class="text-xs text-slate-500 font-mono mt-1 shrink-0">[${r.sequence}]</span><span class="text-sm text-red-400 italic">${r.error}</span>`;
+          streamLines.appendChild(errLine);
+          streamLines.scrollTop = streamLines.scrollHeight;
+          chunkInfo.classList.remove('hidden');
+          chunkInfo.textContent = `utterance ${r.sequence} · error`;
+        } else {
+          if (text) addStreamLine(text, r.sequence, r.processing_time_s);
+          chunkInfo.classList.remove('hidden');
+          chunkInfo.textContent = `utterance ${r.sequence} · ${r.processing_time_s?.toFixed(2)}s`;
+        }
+      };
+
+      try {
+        await client.startStreaming();
+      } catch (e) {
+        statusText.textContent = e.message;
+        streamLines.classList.add('hidden');
+        transcriptEl.classList.remove('hidden');
+        return;
+      }
+      statusText.textContent = 'Streaming... speak, and transcripts appear live. Click to stop.';
+    } else {
+      // Batch mode: hide stream lines
+      streamLines.classList.add('hidden');
+      transcriptEl.classList.remove('hidden');
+
+      try {
+        await client.startRecording();
+      } catch (e) {
+        statusText.textContent = e.message;
+        return;
+      }
+      statusText.textContent = 'Recording... Click to stop.';
     }
+
     recordStart = Date.now();
     timerInterval = setInterval(updateTimer, 500);
     updateTimer();
     setRecordingUI(true);
-    statusText.textContent = 'Recording... Click to stop.';
-    transcriptEl.textContent = '';
-    statsEl.classList.add('hidden');
-    chunkInfo.classList.add('hidden');
+    streamToggle.disabled = true; // lock mode during active session
   }
+
 });
+
 </script>
 </body>
 </html>

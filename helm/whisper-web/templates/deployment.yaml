@@ -31,6 +31,17 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.modelCache.enabled }}
+      initContainers:
+        - name: fix-model-cache-perms
+          image: busybox
+          command: ["sh", "-c", "chown -R 1000:2000 /data"]
+          volumeMounts:
+            - name: model-cache
+              mountPath: /data
+          securityContext:
+            runAsUser: 0
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -46,6 +57,15 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            {{- if .Values.modelCache.enabled }}
+            - name: HF_HOME
+              value: /data/models
+            {{- end }}
+          {{- if .Values.modelCache.enabled }}
+          volumeMounts:
+            - name: model-cache
+              mountPath: /data
+          {{- end }}
           startupProbe:
             {{- toYaml .Values.startupProbe | nindent 12 }}
           livenessProbe:
@@ -53,4 +73,24 @@ spec:
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           resources:
+            {{- if .Values.gpu.enabled }}
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+              {{ .Values.gpu.resource | default "nvidia.com/gpu" }}: {{ .Values.gpu.count | default 1 }}
+            limits:
+              {{- toYaml .Values.resources.limits | nindent 14 }}
+              {{ .Values.gpu.resource | default "nvidia.com/gpu" }}: {{ .Values.gpu.count | default 1 }}
+            {{- else }}
             {{- toYaml .Values.resources | nindent 12 }}
+            {{- end }}
+      {{- if .Values.modelCache.enabled }}
+      volumes:
+        - name: model-cache
+          {{- if .Values.modelCache.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.modelCache.existingClaim }}
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-model-cache
+          {{- end }}
+      {{- end }}

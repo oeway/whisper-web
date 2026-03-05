@@ -6,8 +6,10 @@ import platform
 import struct
 import tempfile
 import time
+import traceback
 import logging
 import concurrent.futures
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -34,6 +36,14 @@ if _is_apple_silicon:
 if not USE_MLX:
     from faster_whisper import WhisperModel
 
+# ---------------------------------------------------------------------------
+# Ensure ffmpeg is on PATH — venv/bin contains a symlink created at install time
+# ---------------------------------------------------------------------------
+import shutil as _shutil
+_venv_bin = str(Path(__file__).resolve().parents[1] / ".venv" / "bin")
+if _venv_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -50,7 +60,20 @@ DEFAULT_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 DEFAULT_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float32")
 ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 MAX_CHUNK_BYTES = int(os.getenv("WHISPER_MAX_CHUNK_BYTES", str(50 * 1024 * 1024)))  # 50 MB
-MAX_WORKERS = int(os.getenv("WHISPER_MAX_WORKERS", "2"))
+
+# MLX uses Apple Metal GPU — not thread-safe, must run one inference at a time.
+# faster-whisper (CPU/CUDA) can parallelize; default to half the logical CPUs.
+_default_workers = 1 if USE_MLX else max(1, (os.cpu_count() or 2) // 2)
+MAX_WORKERS = int(os.getenv("WHISPER_MAX_WORKERS", str(_default_workers)))
+if USE_MLX and MAX_WORKERS > 1:
+    MAX_WORKERS = 1
+    log.warning("MLX backend: overriding WHISPER_MAX_WORKERS to 1 (Metal GPU is not thread-safe)")
+
+# Max number of requests that may be waiting + running at once; excess gets 429.
+MAX_QUEUE = int(os.getenv("WHISPER_MAX_QUEUE", str(MAX_WORKERS * 8)))
+# Per-request inference timeout in seconds.
+INFERENCE_TIMEOUT = float(os.getenv("WHISPER_INFERENCE_TIMEOUT", "120"))
+
 SESSION_TTL_SECONDS = int(os.getenv("WHISPER_SESSION_TTL", "600"))  # 10 minutes
 
 # Auth: set WHISPER_REQUIRE_AUTH=true to require Hypha token validation
@@ -78,12 +101,15 @@ MLX_MODEL_MAP = {
     "large-v3": "mlx-community/whisper-large-v3-mlx",
 }
 
-# Transcription thread pool — configurable via WHISPER_MAX_WORKERS.
-# MLX is single-threaded (GPU), so we default to 2 but only 1 runs at a time on MLX.
-# faster-whisper on CUDA can benefit from 2+ workers if GPU memory allows.
+# Transcription thread pool. Size matches MAX_WORKERS.
 _transcription_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=MAX_WORKERS, thread_name_prefix="whisper"
 )
+
+# Counts requests currently waiting or running in the executor.
+# Requests beyond MAX_QUEUE are rejected with 429 to prevent unbounded queuing.
+# All reads/writes happen in the async event loop thread — no lock needed.
+_active_transcriptions: int = 0
 
 # In-memory session store: session_id -> (last_updated_timestamp, chunks)
 _sessions: Dict[str, Tuple[float, List[bytes]]] = {}
@@ -372,12 +398,79 @@ def _transcribe_ctranslate(path: str, model, language: Optional[str], prompt: Op
 def transcribe_bytes(model_or_repo, audio_bytes: bytes, suffix: str,
                      language: Optional[str], prompt: Optional[str]) -> str:
     lang = language if language and language != "auto" else None
+    thread_name = threading.current_thread().name
+    log.info("transcribe_bytes start: %d bytes lang=%s thread=%s", len(audio_bytes), lang, thread_name)
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
-        if USE_MLX:
-            return _transcribe_mlx(tmp.name, model_or_repo, lang, prompt)
-        return _transcribe_ctranslate(tmp.name, model_or_repo, lang, prompt)
+        t0 = time.monotonic()
+        try:
+            if USE_MLX:
+                result = _transcribe_mlx(tmp.name, model_or_repo, lang, prompt)
+            else:
+                result = _transcribe_ctranslate(tmp.name, model_or_repo, lang, prompt)
+            log.info("transcribe_bytes done: %.2fs text_len=%d thread=%s",
+                     time.monotonic() - t0, len(result), thread_name)
+            return result
+        except FileNotFoundError as exc:
+            if "ffmpeg" in str(exc):
+                log.error("transcribe_bytes ffmpeg not found: %s\n%s", exc, traceback.format_exc())
+                raise RuntimeError(
+                    "ffmpeg not found. Install it (e.g. 'brew install ffmpeg') "
+                    "or add imageio-ffmpeg to the dependencies."
+                ) from exc
+            log.error("transcribe_bytes FileNotFoundError: %s\n%s", exc, traceback.format_exc())
+            raise
+        except Exception as exc:
+            log.error("transcribe_bytes FAILED after %.2fs: %s: %s\n%s",
+                      time.monotonic() - t0, type(exc).__name__, exc, traceback.format_exc())
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Inference runner — shared by all transcription endpoints
+# ---------------------------------------------------------------------------
+async def _run_transcription(
+    model_or_repo,
+    audio_bytes: bytes,
+    language: Optional[str],
+    prompt: Optional[str],
+) -> str:
+    """Submit a transcription job to the thread pool with back-pressure and timeout.
+
+    Raises:
+        HTTPException(429) when MAX_QUEUE concurrent requests are already in flight.
+        HTTPException(504) when inference exceeds INFERENCE_TIMEOUT seconds.
+        Any exception raised by transcribe_bytes propagates to the caller.
+    """
+    global _active_transcriptions
+    if _active_transcriptions >= MAX_QUEUE:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Server busy: {_active_transcriptions} requests in flight "
+                f"(limit {MAX_QUEUE}). Retry shortly."
+            ),
+        )
+    _active_transcriptions += 1
+    try:
+        loop = asyncio.get_event_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    _transcription_executor,
+                    transcribe_bytes,
+                    model_or_repo, audio_bytes, ".wav", language, prompt,
+                ),
+                timeout=INFERENCE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Inference timed out after {INFERENCE_TIMEOUT:.0f}s",
+            )
+    finally:
+        _active_transcriptions -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +484,92 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# ---------------------------------------------------------------------------
+# Request logging middleware — logs every request with timing and status code
+# ---------------------------------------------------------------------------
+class _RequestLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        t0 = time.monotonic()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        except Exception as exc:
+            log.exception("Middleware caught unhandled exception: %s", exc)
+            raise
+        finally:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            # Skip noisy health probes at DEBUG level
+            if request.url.path.startswith("/health"):
+                log.debug("REQ %s %s → %d  %.0fms",
+                          request.method, request.url.path, status_code, elapsed_ms)
+            else:
+                log.info("REQ %s %s → %d  %.0fms",
+                         request.method, request.url.path, status_code, elapsed_ms)
+
+app.add_middleware(_RequestLogMiddleware)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception(request: Request, exc: Exception):
+    log.error(
+        "500 on %s %s — %s: %s\n%s",
+        request.method, request.url.path,
+        type(exc).__name__, exc,
+        traceback.format_exc(),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {exc}"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Periodic server stats — logs every 60 s: thread count, open sessions,
+# executor queue depth, memory RSS
+# ---------------------------------------------------------------------------
+def _log_server_stats():
+    try:
+        import resource as _resource
+        rss_mb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+    except Exception:
+        rss_mb = -1
+    executor = _transcription_executor
+    # ThreadPoolExecutor internal counters (best-effort)
+    try:
+        pending = executor._work_queue.qsize()
+        active = len([t for t in executor._threads if t.is_alive()])
+    except Exception:
+        pending, active = -1, -1
+    log.info(
+        "STATS sessions=%d executor_active=%d executor_pending=%d threads=%d rss_mb=%.1f",
+        len(_sessions), active, pending, threading.active_count(), rss_mb,
+    )
+
+
+async def _stats_loop():
+    while True:
+        await asyncio.sleep(60)
+        _log_server_stats()
+
+
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(_stats_loop())
+    # Periodic session cleanup
+    async def _cleanup_loop():
+        while True:
+            await asyncio.sleep(SESSION_TTL_SECONDS / 2)
+            _evict_stale_sessions()
+    asyncio.create_task(_cleanup_loop())
+    log.info("Preloading default model '%s' ...", DEFAULT_MODEL_SIZE)
+    await model_pool.preload(DEFAULT_MODEL_SIZE)
 
 
 @app.on_event("shutdown")
@@ -417,6 +596,11 @@ async def health():
         "device": "apple-silicon-gpu" if USE_MLX else DEFAULT_DEVICE,
         "compute_type": "mlx-float16" if USE_MLX else DEFAULT_COMPUTE_TYPE,
         "auth_required": REQUIRE_AUTH,
+        "concurrency": {
+            "max_workers": MAX_WORKERS,
+            "max_queue": MAX_QUEUE,
+            "active": _active_transcriptions,
+        },
     }
 
 
@@ -485,6 +669,83 @@ async def upload_chunk(
     }
 
 
+def _validate_model_size(model_size: str) -> str:
+    if model_size not in ALLOWED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid model_size '{model_size}', must be one of {sorted(ALLOWED_MODELS)}",
+        )
+    return model_size
+
+
+def _filter_hallucination(text: str) -> str:
+    """Return empty string when Whisper output looks like a hallucination.
+
+    Whisper commonly hallucinates on silent/noisy audio by producing highly
+    repetitive output (e.g. "Yeah Yeah Yeah…" or "Thank you. Thank you.").
+    Detect this by checking whether a single word dominates >40% of the output.
+    """
+    if not text:
+        return text
+    words = text.split()
+    if len(words) < 6:
+        return text
+    from collections import Counter
+    top_word, top_count = Counter(words).most_common(1)[0]
+    if top_count / len(words) > 0.40:
+        log.info("Hallucination suppressed: top word '%s' (%d/%d)", top_word, top_count, len(words))
+        return ""
+    return text
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(
+    request: Request,
+    audio: UploadFile = File(...),
+    model_size: str = Query(DEFAULT_MODEL_SIZE),
+    language: str = Query("auto"),
+    context: str = Query("", description="Previous transcript text passed as Whisper initial_prompt"),
+    user: Optional[dict] = Depends(get_current_user),
+):
+    """Stateless transcription endpoint — send any audio file, get text back.
+
+    This is the recommended endpoint for production use and horizontal scaling.
+    No session state is kept server-side; the caller supplies the full audio.
+    Accepts WAV (preferred), MP3, OGG, FLAC, M4A and most formats ffmpeg understands.
+
+    The optional ``context`` parameter (last few sentences of prior transcript)
+    is forwarded to Whisper as ``initial_prompt`` for better cross-sentence coherence.
+    """
+    _validate_model_size(model_size)
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="empty audio")
+    if len(audio_bytes) > MAX_CHUNK_BYTES:
+        raise HTTPException(status_code=413, detail=f"audio exceeds max size ({MAX_CHUNK_BYTES} bytes)")
+
+    lang = language if language and language != "auto" else None
+    prompt = context.strip()[-500:] if context else ""
+    model_or_repo = await model_pool.get(model_size)
+    t0 = time.monotonic()
+    raw_text = await _run_transcription(model_or_repo, audio_bytes, lang, prompt)
+    text = _filter_hallucination(raw_text)
+    elapsed = time.monotonic() - t0
+
+    log.info("Transcribe (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
+             len(audio_bytes), elapsed, model_size, language,
+             (user or {}).get("email", "anonymous"))
+    _log_activity("transcribe", user=user, model=model_size, language=language,
+                  file_size_bytes=len(audio_bytes), processing_time_s=round(elapsed, 3),
+                  text_length=len(text), client_ip=request.client.host if request.client else None)
+    return {
+        "text": text,
+        "file_size_bytes": len(audio_bytes),
+        "processing_time_s": round(elapsed, 3),
+        "model": model_size,
+        "language": language,
+    }
+
+
 @app.post("/api/session/{session_id}/transcribe")
 async def transcribe_session(
     session_id: str,
@@ -494,12 +755,12 @@ async def transcribe_session(
     prompt: str = "",
     user: Optional[dict] = Depends(get_current_user),
 ):
-    """Concatenate all chunks for this session and transcribe as one audio."""
-    if model_size not in ALLOWED_MODELS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"invalid model_size '{model_size}', must be one of {sorted(ALLOWED_MODELS)}",
-        )
+    """Concatenate all chunks for this session and transcribe as one audio.
+
+    Note: sessions are in-memory per-pod. In a multi-replica deployment use
+    sticky sessions (sessionAffinity: ClientIP) or prefer /api/transcribe.
+    """
+    _validate_model_size(model_size)
     entry = _sessions.pop(session_id, None)
     if entry is None:
         raise HTTPException(status_code=404, detail="no audio for this session")
@@ -508,35 +769,21 @@ async def transcribe_session(
     combined = _concat_wav_chunks(chunks)
     file_size = len(combined)
     num_chunks = len(chunks)
+    lang = language if language and language != "auto" else None
 
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-
-    loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(
-        _transcription_executor,
-        transcribe_bytes,
-        model_or_repo, combined, ".wav", language, prompt,
-    )
-
+    raw_text = await _run_transcription(model_or_repo, combined, lang, prompt or None)
+    text = _filter_hallucination(raw_text)
     elapsed = time.monotonic() - t0
-    log.info(
-        "Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
-        num_chunks, file_size, elapsed, model_size, language,
-        (user or {}).get("email", "anonymous"),
-    )
-    _log_activity(
-        "transcribe",
-        user=user,
-        session_id=session_id,
-        model=model_size,
-        language=language,
-        chunks=num_chunks,
-        file_size_bytes=file_size,
-        processing_time_s=round(elapsed, 3),
-        text_length=len(text),
-        client_ip=request.client.host if request.client else None,
-    )
+
+    log.info("Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
+             num_chunks, file_size, elapsed, model_size, language,
+             (user or {}).get("email", "anonymous"))
+    _log_activity("transcribe", user=user, session_id=session_id, model=model_size,
+                  language=language, chunks=num_chunks, file_size_bytes=file_size,
+                  processing_time_s=round(elapsed, 3), text_length=len(text),
+                  client_ip=request.client.host if request.client else None)
     return {
         "text": text,
         "chunks": num_chunks,
@@ -545,6 +792,52 @@ async def transcribe_session(
         "model": model_size,
         "language": language,
         "prompt": prompt,
+    }
+
+
+@app.post("/api/stream/utterance")
+async def stream_utterance(
+    request: Request,
+    audio: UploadFile = File(...),
+    model_size: str = Query(DEFAULT_MODEL_SIZE),
+    language: str = Query("auto"),
+    context: str = Query(""),
+    sequence: int = Query(0),
+    user: Optional[dict] = Depends(get_current_user),
+):
+    """Streaming VAD endpoint — transcribe one detected utterance and return immediately.
+
+    Thin wrapper around /api/transcribe that adds the ``sequence`` field for
+    client-side ordering of concurrent in-flight requests.
+    """
+    _validate_model_size(model_size)
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="empty audio")
+    if len(audio_bytes) > MAX_CHUNK_BYTES:
+        raise HTTPException(status_code=413, detail=f"utterance exceeds max size ({MAX_CHUNK_BYTES} bytes)")
+
+    lang = language if language and language != "auto" else None
+    prompt = context.strip()[-500:] if context else ""
+    model_or_repo = await model_pool.get(model_size)
+    t0 = time.monotonic()
+    raw_text = await _run_transcription(model_or_repo, audio_bytes, lang, prompt)
+    text = _filter_hallucination(raw_text)
+    elapsed = time.monotonic() - t0
+
+    log.info("Stream utterance seq=%d (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
+             sequence, len(audio_bytes), elapsed, model_size, language,
+             (user or {}).get("email", "anonymous"))
+    _log_activity("stream_utterance", user=user, model=model_size, language=language,
+                  file_size_bytes=len(audio_bytes), processing_time_s=round(elapsed, 3),
+                  text_length=len(text), client_ip=request.client.host if request.client else None)
+    return {
+        "text": text,
+        "sequence": sequence,
+        "file_size_bytes": len(audio_bytes),
+        "processing_time_s": round(elapsed, 3),
+        "model": model_size,
+        "language": language,
     }
 
 
@@ -615,21 +908,6 @@ async def transcribe_audio(
     }
 
 
-# ---------------------------------------------------------------------------
-# Periodic session cleanup
-# ---------------------------------------------------------------------------
-@app.on_event("startup")
-async def _startup():
-    # Pre-load the default model so it's ready for the first request
-    log.info("Preloading default model '%s' ...", DEFAULT_MODEL_SIZE)
-    await model_pool.preload(DEFAULT_MODEL_SIZE)
-
-    # Periodic session cleanup
-    async def _cleanup_loop():
-        while True:
-            await asyncio.sleep(SESSION_TTL_SECONDS / 2)
-            _evict_stale_sessions()
-    asyncio.create_task(_cleanup_loop())
 
 
 if FRONTEND_DIR.exists():

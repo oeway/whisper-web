@@ -21,6 +21,33 @@ export interface TranscriptionResult {
   prompt: string;
 }
 
+/** Result from a single utterance in streaming mode. */
+export interface StreamUtteranceResult {
+  /** Transcribed text for this utterance. */
+  text: string;
+  /** 1-based sequence number (useful for ordering out-of-order responses). */
+  sequence: number;
+  file_size_bytes: number;
+  processing_time_s: number;
+  model: string;
+  language: string;
+}
+
+/** Result returned by stopStreaming(). */
+export interface StreamingResult {
+  /** Full concatenated transcript of all utterances so far. */
+  text: string;
+  /** Total number of utterances transcribed. */
+  utterances: number;
+}
+
+export interface StreamingOptions {
+  /** Silence duration (ms) that ends an utterance. Default: 1000. */
+  utteranceGapMs?: number;
+  /** Max utterance duration (ms) before a forced flush. Default: 25000. */
+  maxUtteranceMs?: number;
+}
+
 export interface ChunkUploadInfo {
   chunks: number;
   totalBytes: number;
@@ -35,7 +62,7 @@ export interface HealthResponse {
   auth_required: boolean;
 }
 
-export type StatusValue = 'recording' | 'transcribing' | 'done' | 'error' | 'no_speech';
+export type StatusValue = 'recording' | 'transcribing' | 'streaming' | 'done' | 'error' | 'no_speech';
 
 export class WhisperClient {
   /** Base URL of the whisper server. */
@@ -49,24 +76,43 @@ export class WhisperClient {
   /** Optional initial prompt. */
   prompt: string;
 
-  /** Called after each chunk is uploaded to the server. */
+  /** Called after each chunk is uploaded to the server (batch mode). */
   onChunkUploaded: ((info: ChunkUploadInfo) => void) | null;
   /** Called when the client status changes. */
   onStatusChange: ((status: StatusValue) => void) | null;
+  /**
+   * Streaming mode only. Called as each utterance is transcribed in real time.
+   * May be called concurrently — use `sequence` to order results if needed.
+   */
+  onTranscript: ((result: StreamUtteranceResult) => void) | null;
 
-  /** Whether the client is currently recording. */
+  /** Whether the client is currently recording (batch mode). */
   readonly recording: boolean;
+  /** Whether the client is currently streaming (live utterance mode). */
+  readonly streaming: boolean;
 
   constructor(options?: WhisperClientOptions);
 
   /** Check server health. */
   getHealth(): Promise<HealthResponse>;
 
-  /** Start recording from the microphone with VAD-filtered chunk streaming. */
+  /** Start recording from the microphone with VAD-filtered chunk streaming (batch mode). */
   startRecording(): Promise<void>;
 
-  /** Stop recording, flush remaining audio, and transcribe the session. */
+  /** Stop recording, flush remaining audio, and transcribe the session (batch mode). */
   stopRecording(): Promise<TranscriptionResult>;
+
+  /**
+   * Start live streaming mode. Audio is transcribed utterance-by-utterance as
+   * the user speaks. Each completed utterance fires `onTranscript`.
+   */
+  startStreaming(options?: StreamingOptions): Promise<void>;
+
+  /**
+   * Stop live streaming, flush any remaining utterance, and return the full
+   * accumulated transcript.
+   */
+  stopStreaming(): Promise<StreamingResult>;
 
   /** Single-shot transcription of an audio blob/file. */
   transcribe(audioBlob: Blob, filename?: string): Promise<TranscriptionResult>;

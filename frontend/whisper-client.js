@@ -15,6 +15,12 @@ const DEFAULT_VAD_THRESHOLD = 0.012;
 const DEFAULT_VAD_HANGOVER_MS = 800;
 const DEFAULT_VAD_WARMUP_MS = 3000;
 
+// -- Streaming VAD defaults --
+const DEFAULT_STREAM_UTTERANCE_GAP_MS = 1500;   // silence duration that ends an utterance
+const DEFAULT_STREAM_MAX_UTTERANCE_MS = 25000;  // max utterance length before forced flush
+const DEFAULT_STREAM_PRE_ROLL_CHUNKS = 5;       // chunks of pre-roll before speech onset
+const STREAM_SAMPLE_RATE = 16000;               // request 16 kHz — Whisper's native rate
+
 // -- Helpers --
 function encodeWav(samples, sampleRate) {
   const bytesPerSample = 2;
@@ -75,9 +81,15 @@ export class WhisperClient {
     this.onChunkUploaded = null;
     /** @type {((status: string) => void) | null} */
     this.onStatusChange = null;
+    /**
+     * Streaming mode only. Called for each transcribed utterance.
+     * @type {((result: {text: string, sequence: number, processing_time_s: number}) => void) | null}
+     */
+    this.onTranscript = null;
 
     // Internal state
     this._recording = false;
+    this._streaming = false;
     this._sessionId = null;
     this._mediaStream = null;
     this._audioCtx = null;
@@ -86,24 +98,43 @@ export class WhisperClient {
     this._muteNode = null;
     this._chunkTimer = null;
 
-    // PCM accumulator
+    // PCM accumulator (batch mode)
     this._pcmBuffers = [];
     this._pcmLength = 0;
 
-    // VAD state
+    // VAD state (shared)
     this._speaking = false;
     this._lastSpeech = 0;
     this._noiseFloor = 0.004;
     this._vadWarmupUntil = 0;
 
-    // Chunk tracking
+    // Chunk tracking (batch mode)
     this._chunksSent = 0;
     this._totalBytesSent = 0;
+
+    // Streaming mode state
+    this._streamPreRollBuffers = [];   // circular pre-roll buffer (audio before speech)
+    this._streamPreRollLength = 0;
+    this._streamSpeechBuffers = [];    // current utterance audio
+    this._streamSpeechLength = 0;
+    this._streamInSpeech = false;      // speech currently active
+    this._streamInUtterance = false;   // in utterance (speech + hangover)
+    this._streamLastSpeech = 0;
+    this._streamSequence = 0;
+    this._streamContext = '';          // accumulated transcript for Whisper prompt
+    this._streamAccumulated = '';      // full transcript returned by stopStreaming
+    this._streamTimer = null;
+    this._streamSampleRate = 16000;
   }
 
-  /** Whether the client is currently recording. */
+  /** Whether the client is currently recording (batch mode). */
   get recording() {
     return this._recording;
+  }
+
+  /** Whether the client is currently streaming (live utterance mode). */
+  get streaming() {
+    return this._streaming;
   }
 
   // -- Auth header --
@@ -278,12 +309,185 @@ export class WhisperClient {
   }
 
   /**
+   * Start live streaming mode: audio is transcribed utterance-by-utterance in
+   * real time as the user speaks. Each completed utterance fires `onTranscript`.
+   *
+   * @param {object} [options]
+   * @param {number} [options.utteranceGapMs]   Silence gap (ms) that ends an utterance (default 1000)
+   * @param {number} [options.maxUtteranceMs]   Max utterance length before forced flush (default 25000)
+   * @returns {Promise<void>}
+   */
+  async startStreaming(options = {}) {
+    if (this._recording || this._streaming) throw new Error('Already active');
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('getUserMedia not available in this browser');
+    }
+
+    const utteranceGapMs = options.utteranceGapMs ?? DEFAULT_STREAM_UTTERANCE_GAP_MS;
+    const maxUtteranceMs = options.maxUtteranceMs ?? DEFAULT_STREAM_MAX_UTTERANCE_MS;
+
+    this._mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    // Request 16 kHz directly — this is Whisper's native sample rate.
+    // The browser resamples from hardware rate (44100/48000 Hz) to 16000 Hz
+    // in high quality, eliminating the need for server-side ffmpeg resampling
+    // per utterance and significantly improving transcription quality.
+    this._audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: STREAM_SAMPLE_RATE });
+    this._streamSampleRate = this._audioCtx.sampleRate;
+    this._sourceNode = this._audioCtx.createMediaStreamSource(this._mediaStream);
+    this._processorNode = this._audioCtx.createScriptProcessor(4096, 1, 1);
+    this._muteNode = this._audioCtx.createGain();
+    this._muteNode.gain.value = 0;
+    this._sourceNode.connect(this._processorNode);
+    this._processorNode.connect(this._muteNode);
+    this._muteNode.connect(this._audioCtx.destination);
+    await this._audioCtx.resume();
+
+    // Reset streaming state
+    this._streamPreRollBuffers = [];
+    this._streamPreRollLength = 0;
+    this._streamSpeechBuffers = [];
+    this._streamSpeechLength = 0;
+    this._streamInSpeech = false;
+    this._streamInUtterance = false;
+    this._streamLastSpeech = 0;
+    this._streamSequence = 0;
+    this._streamContext = '';
+    this._streamAccumulated = '';
+    this._noiseFloor = 0.004;
+    this._vadWarmupUntil = performance.now() + DEFAULT_VAD_WARMUP_MS;
+
+    const maxUtteranceSamples = Math.ceil((maxUtteranceMs / 1000) * this._streamSampleRate);
+
+    this._processorNode.onaudioprocess = (e) => {
+      if (!this._streaming) return;
+      const input = e.inputBuffer.getChannelData(0);
+
+      // Adaptive VAD
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+      const rms = Math.sqrt(sum / input.length);
+      this._noiseFloor = 0.97 * this._noiseFloor + 0.03 * Math.min(rms, this._noiseFloor * 3);
+      const threshold = Math.max(DEFAULT_VAD_THRESHOLD * 0.35, this._noiseFloor * 2.2);
+      const now = performance.now();
+      const inWarmup = now < this._vadWarmupUntil;
+      const speaking = !inWarmup && rms > threshold;
+
+      const copy = new Float32Array(input.length);
+      copy.set(input);
+
+      if (speaking) {
+        this._streamLastSpeech = now;
+        if (!this._streamInSpeech) {
+          // Speech onset: include pre-roll so we don't clip the utterance start
+          this._streamSpeechBuffers = [...this._streamPreRollBuffers, copy];
+          this._streamSpeechLength = this._streamPreRollLength + copy.length;
+          this._streamPreRollBuffers = [];
+          this._streamPreRollLength = 0;
+          this._streamInSpeech = true;
+          this._streamInUtterance = true;
+        } else {
+          this._streamSpeechBuffers.push(copy);
+          this._streamSpeechLength += copy.length;
+        }
+      } else {
+        if (this._streamInUtterance) {
+          // Collect audio during hangover so we don't clip the utterance end
+          this._streamSpeechBuffers.push(copy);
+          this._streamSpeechLength += copy.length;
+        } else {
+          // Maintain pre-roll ring buffer during silence
+          this._streamPreRollBuffers.push(copy);
+          this._streamPreRollLength += copy.length;
+          if (this._streamPreRollBuffers.length > DEFAULT_STREAM_PRE_ROLL_CHUNKS) {
+            const evicted = this._streamPreRollBuffers.shift();
+            this._streamPreRollLength -= evicted.length;
+          }
+        }
+      }
+
+      // Force-flush if utterance exceeds max duration
+      if (this._streamInUtterance && this._streamSpeechLength >= maxUtteranceSamples) {
+        this._streamInSpeech = false;
+        this._streamInUtterance = false;
+        this._streamLastSpeech = 0;
+        this._flushUtterance();
+      }
+    };
+
+    // Periodically check if utterance has ended (silence > gap)
+    this._streamTimer = setInterval(() => {
+      if (!this._streaming || !this._streamInUtterance) return;
+      const now = performance.now();
+      if (now - this._streamLastSpeech > utteranceGapMs) {
+        this._streamInSpeech = false;
+        this._streamInUtterance = false;
+        this._flushUtterance();
+      }
+    }, 100);
+
+    this._streaming = true;
+    this._setStatus('streaming');
+  }
+
+  /**
+   * Stop live streaming, flush any remaining utterance, and return the
+   * accumulated transcript text.
+   *
+   * @returns {Promise<{text: string, utterances: number}>}
+   */
+  async stopStreaming() {
+    if (!this._streaming) throw new Error('Not streaming');
+    this._streaming = false;
+
+    clearInterval(this._streamTimer);
+    this._streamTimer = null;
+
+    // Flush whatever utterance audio remains
+    let finalFlushPromise = null;
+    if (this._streamSpeechLength > 0) {
+      this._streamInSpeech = false;
+      this._streamInUtterance = false;
+      finalFlushPromise = this._flushUtterance();
+    }
+
+    // Tear down audio nodes
+    if (this._processorNode) this._processorNode.disconnect();
+    if (this._sourceNode) this._sourceNode.disconnect();
+    if (this._muteNode) this._muteNode.disconnect();
+    if (this._mediaStream) this._mediaStream.getTracks().forEach((t) => t.stop());
+    if (this._audioCtx) {
+      this._audioCtx.close();
+      this._audioCtx = null;
+    }
+
+    // Wait for final utterance to finish transcribing
+    if (finalFlushPromise) await finalFlushPromise;
+
+    this._setStatus('done');
+    return {
+      text: this._streamAccumulated.trim(),
+      utterances: this._streamSequence,
+    };
+  }
+
+  /**
    * Release resources. Safe to call multiple times.
    */
   destroy() {
     if (this._recording) {
       this._recording = false;
       clearInterval(this._chunkTimer);
+    }
+    if (this._streaming) {
+      this._streaming = false;
+      clearInterval(this._streamTimer);
+      this._streamTimer = null;
+      this._streamSpeechBuffers = [];
+      this._streamSpeechLength = 0;
+      this._streamPreRollBuffers = [];
+      this._streamPreRollLength = 0;
     }
     if (this._processorNode) {
       this._processorNode.disconnect();
@@ -311,6 +515,56 @@ export class WhisperClient {
   }
 
   // -- Internal --
+
+  async _flushUtterance() {
+    const buffers = this._streamSpeechBuffers;
+    const length = this._streamSpeechLength;
+    this._streamSpeechBuffers = [];
+    this._streamSpeechLength = 0;
+
+    if (length === 0) return;
+
+    const merged = mergeBuffers(buffers, length);
+    const wavBlob = encodeWav(merged, this._streamSampleRate);
+    if (wavBlob.size < 1200) return; // too short to be meaningful
+
+    const seq = ++this._streamSequence;
+    const form = new FormData();
+    form.append('audio', wavBlob, 'utterance.wav');
+    const params = new URLSearchParams({
+      model_size: this.model,
+      language: this.language,
+      sequence: seq,
+      context: this._streamContext,
+    });
+
+    try {
+      const resp = await fetch(`${this.server}/api/stream/utterance?${params}`, {
+        method: 'POST',
+        headers: this._authHeaders(),
+        body: form,
+      });
+      if (resp.ok) {
+        const result = await resp.json();
+        const trimmed = (result.text || '').trim();
+        if (trimmed) {
+          // Keep last 500 chars as Whisper prompt context for the next utterance
+          this._streamContext = (this._streamContext + ' ' + trimmed).trim().slice(-500);
+          this._streamAccumulated = (this._streamAccumulated + ' ' + trimmed).trim();
+        }
+        if (this.onTranscript) this.onTranscript(result);
+      } else {
+        let detail = `HTTP ${resp.status}`;
+        try { const j = await resp.json(); detail = j.detail || detail; } catch (_) {}
+        console.error(`[WhisperClient] stream utterance seq=${seq} failed: ${detail}`);
+        if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: detail });
+      }
+    } catch (err) {
+      // Network error — non-fatal, utterance is lost but streaming continues
+      console.error(`[WhisperClient] stream utterance seq=${seq} network error:`, err);
+      if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: err.message });
+    }
+  }
 
   async _flushChunk(force = false) {
     if (this._pcmLength === 0 || !this._audioCtx) return;
