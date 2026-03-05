@@ -54,7 +54,8 @@ log.info(
     "mlx-whisper (Apple Silicon GPU)" if USE_MLX else "faster-whisper (CPU/CUDA)",
 )
 
-FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+FRONTEND_DIR = Path(os.getenv("WHISPER_FRONTEND_DIR",
+                             str(Path(__file__).resolve().parents[2] / "frontend")))
 DEFAULT_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
 DEFAULT_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 DEFAULT_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float32")

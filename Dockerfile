@@ -30,6 +30,7 @@ ENV HF_HOME=/data/models \
     WHISPER_MODEL_SIZE=small \
     WHISPER_DEVICE=cpu \
     WHISPER_COMPUTE_TYPE=int8_float32 \
+    WHISPER_FRONTEND_DIR=/app/frontend \
     UVICORN_WORKERS=1
 
 # Pre-download the default model during build so the first pod starts instantly.
@@ -38,6 +39,7 @@ ENV HF_HOME=/data/models \
 ARG PRELOAD_MODEL=true
 RUN if [ "$PRELOAD_MODEL" = "true" ]; then \
         python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL_SIZE}', device='cpu', compute_type='float32')"; \
+        chown -R 1000:2000 /data && chmod -R g+r /data; \
     fi
 
 USER 1000
