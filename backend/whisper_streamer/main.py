@@ -21,19 +21,32 @@ from fastapi.staticfiles import StaticFiles
 
 
 # ---------------------------------------------------------------------------
-# Detect backend engine: MLX on Apple Silicon, faster-whisper elsewhere
+# Detect backend engine.
+# Priority (auto): MLX on Apple Silicon → whisperX if installed → faster-whisper
+# Override with WHISPER_BACKEND=mlx|whisperx|faster-whisper
 # ---------------------------------------------------------------------------
 USE_MLX = False
+USE_WHISPERX = False
 _is_apple_silicon = platform.system() == "Darwin" and platform.machine() == "arm64"
+_backend_pref = os.getenv("WHISPER_BACKEND", "auto").lower()
 
-if _is_apple_silicon:
+if _backend_pref in ("mlx", "auto") and _is_apple_silicon:
     try:
         import mlx_whisper  # noqa: F401
         USE_MLX = True
     except ImportError:
-        pass
+        if _backend_pref == "mlx":
+            raise RuntimeError("WHISPER_BACKEND=mlx but mlx-whisper is not installed")
 
-if not USE_MLX:
+if not USE_MLX and _backend_pref in ("whisperx", "auto"):
+    try:
+        import whisperx as _wx  # noqa: F401
+        USE_WHISPERX = True
+    except ImportError:
+        if _backend_pref == "whisperx":
+            raise RuntimeError("WHISPER_BACKEND=whisperx but whisperx is not installed")
+
+if not USE_MLX and not USE_WHISPERX:
     from faster_whisper import WhisperModel
 
 # ---------------------------------------------------------------------------
@@ -49,10 +62,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
-log.info(
-    "Whisper backend: %s",
-    "mlx-whisper (Apple Silicon GPU)" if USE_MLX else "faster-whisper (CPU/CUDA)",
+
+_backend_name = (
+    "mlx-whisper (Apple Silicon GPU)" if USE_MLX
+    else "whisperX (VAD+alignment+diarization)" if USE_WHISPERX
+    else "faster-whisper (CPU/CUDA)"
 )
+log.info("Whisper backend: %s", _backend_name)
 
 FRONTEND_DIR = Path(os.getenv("WHISPER_FRONTEND_DIR",
                              str(Path(__file__).resolve().parents[2] / "frontend")))
@@ -62,8 +78,12 @@ DEFAULT_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float32")
 ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 MAX_CHUNK_BYTES = int(os.getenv("WHISPER_MAX_CHUNK_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 
+# whisperX/HF token for speaker diarization (pyannote.audio requires acceptance of terms)
+DIARIZE_HF_TOKEN = os.getenv("WHISPER_HF_TOKEN", "")
+WHISPERX_BATCH_SIZE = int(os.getenv("WHISPERX_BATCH_SIZE", "8"))
+
 # MLX uses Apple Metal GPU — not thread-safe, must run one inference at a time.
-# faster-whisper (CPU/CUDA) can parallelize; default to half the logical CPUs.
+# faster-whisper / whisperX on CPU can parallelize; default to half the logical CPUs.
 _default_workers = 1 if USE_MLX else max(1, (os.cpu_count() or 2) // 2)
 MAX_WORKERS = int(os.getenv("WHISPER_MAX_WORKERS", str(_default_workers)))
 if USE_MLX and MAX_WORKERS > 1:
@@ -333,7 +353,35 @@ class ModelPool:
             model_size = DEFAULT_MODEL_SIZE
         if USE_MLX:
             return MLX_MODEL_MAP.get(model_size, MLX_MODEL_MAP["small"])
+        if USE_WHISPERX:
+            return await self._get_whisperx(model_size)
         return await self._get_ctranslate(model_size)
+
+    async def _get_whisperx(self, model_size: str):
+        if model_size in self._models:
+            return self._models[model_size]
+        async with self._lock:
+            if model_size in self._models:
+                return self._models[model_size]
+            loop = asyncio.get_event_loop()
+            model = await loop.run_in_executor(
+                _transcription_executor, self._load_whisperx, model_size
+            )
+            self._models[model_size] = model
+            return model
+
+    def _load_whisperx(self, model_size: str):
+        import whisperx
+        device = self._device if self._device != "auto" else "cpu"
+        compute = self._compute_type if self._compute_type not in ("float32", "auto") else "int8"
+        log.info("Loading whisperX model %s (device=%s compute=%s)...", model_size, device, compute)
+        try:
+            m = whisperx.load_model(model_size, device=device, compute_type=compute)
+        except Exception as exc:
+            log.warning("whisperX load failed (%s), retrying int8: %s", compute, exc)
+            m = whisperx.load_model(model_size, device=device, compute_type="int8")
+        log.info("whisperX model %s ready", model_size)
+        return m
 
     async def _get_ctranslate(self, model_size: str):
         if model_size in self._models:
@@ -364,6 +412,114 @@ class ModelPool:
             m = WhisperModel(model_size, device=self._device, compute_type="float32")
         log.info("faster-whisper model %s ready", model_size)
         return m
+
+
+# ---------------------------------------------------------------------------
+# whisperX engine — align models and diarization pipeline cached per process
+# ---------------------------------------------------------------------------
+_wx_align_models: Dict[str, Any] = {}   # language_code → (model, metadata)
+_wx_diarize_pipeline: Optional[Any] = None
+
+
+def _wx_get_align_model(language_code: str, device: str):
+    if language_code not in _wx_align_models:
+        import whisperx
+        log.info("Loading whisperX alignment model for language '%s'", language_code)
+        model_a, meta = whisperx.load_align_model(language_code=language_code, device=device)
+        _wx_align_models[language_code] = (model_a, meta)
+    return _wx_align_models[language_code]
+
+
+def _wx_get_diarize_pipeline(device: str):
+    global _wx_diarize_pipeline
+    if _wx_diarize_pipeline is None:
+        if not DIARIZE_HF_TOKEN:
+            raise RuntimeError(
+                "Speaker diarization requires a HuggingFace token. "
+                "Set WHISPER_HF_TOKEN to a token with access to "
+                "pyannote/speaker-diarization-3.1."
+            )
+        import whisperx
+        log.info("Loading whisperX diarization pipeline...")
+        _wx_diarize_pipeline = whisperx.DiarizationPipeline(
+            use_auth_token=DIARIZE_HF_TOKEN, device=device
+        )
+        log.info("Diarization pipeline ready")
+    return _wx_diarize_pipeline
+
+
+def _transcribe_whisperx(
+    wx_model,
+    audio_bytes: bytes,
+    language: Optional[str],
+    prompt: Optional[str],
+    align: bool,
+    diarize: bool,
+    min_speakers: int,
+    max_speakers: int,
+    device: str,
+) -> dict:
+    """Full whisperX pipeline: transcribe → [align] → [diarize]."""
+    import whisperx, soundfile as sf
+
+    # WAV bytes → float32 numpy at native sample rate
+    audio, sr = sf.read(io.BytesIO(audio_bytes))
+    audio = audio.astype("float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)  # mix to mono
+
+    thread_name = threading.current_thread().name
+    t0 = time.monotonic()
+    log.info("whisperX transcribe start: %d bytes lang=%s thread=%s", len(audio_bytes), language, thread_name)
+
+    # Step 1: transcribe
+    kwargs: dict = {"batch_size": WHISPERX_BATCH_SIZE}
+    if language:
+        kwargs["language"] = language
+    result = wx_model.transcribe(audio, **kwargs)
+    detected_lang = result.get("language", language or "en")
+    log.info("whisperX transcribe done: %.2fs segments=%d lang=%s",
+             time.monotonic() - t0, len(result["segments"]), detected_lang)
+
+    segments = result["segments"]
+    if not segments:
+        return {"text": "", "segments": [], "language": detected_lang}
+
+    # Step 2: word-level alignment
+    if align:
+        try:
+            t1 = time.monotonic()
+            model_a, meta = _wx_get_align_model(detected_lang, device)
+            segments_aligned = whisperx.align(segments, model_a, meta, audio, device,
+                                              return_char_alignments=False)
+            segments = segments_aligned["segments"]
+            log.info("whisperX align done: %.2fs", time.monotonic() - t1)
+        except Exception as exc:
+            log.warning("whisperX alignment failed (continuing without): %s", exc)
+
+    # Step 3: speaker diarization
+    if diarize:
+        try:
+            t2 = time.monotonic()
+            pipeline = _wx_get_diarize_pipeline(device)
+            diarize_kwargs: dict = {}
+            if min_speakers > 1:
+                diarize_kwargs["min_speakers"] = min_speakers
+            if max_speakers < 10:
+                diarize_kwargs["max_speakers"] = max_speakers
+            diarize_segs = pipeline(audio, **diarize_kwargs)
+            result_with_speakers = whisperx.assign_word_speakers(
+                diarize_segs, {"segments": segments}
+            )
+            segments = result_with_speakers["segments"]
+            log.info("whisperX diarize done: %.2fs", time.monotonic() - t2)
+        except Exception as exc:
+            log.warning("whisperX diarization failed (continuing without): %s", exc)
+
+    # Build flat text from segments
+    text = " ".join(s.get("text", "").strip() for s in segments if s.get("text", "").strip())
+    log.info("whisperX total: %.2fs text_len=%d", time.monotonic() - t0, len(text))
+    return {"text": text, "segments": segments, "language": detected_lang}
 
 
 # ---------------------------------------------------------------------------
@@ -436,13 +592,18 @@ async def _run_transcription(
     audio_bytes: bytes,
     language: Optional[str],
     prompt: Optional[str],
-) -> str:
+    align: bool = True,
+    diarize: bool = False,
+    min_speakers: int = 1,
+    max_speakers: int = 10,
+) -> dict:
     """Submit a transcription job to the thread pool with back-pressure and timeout.
+
+    Returns a dict: {text, segments, language} — segments is None for non-whisperX backends.
 
     Raises:
         HTTPException(429) when MAX_QUEUE concurrent requests are already in flight.
         HTTPException(504) when inference exceeds INFERENCE_TIMEOUT seconds.
-        Any exception raised by transcribe_bytes propagates to the caller.
     """
     global _active_transcriptions
     if _active_transcriptions >= MAX_QUEUE:
@@ -457,14 +618,28 @@ async def _run_transcription(
     try:
         loop = asyncio.get_event_loop()
         try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(
-                    _transcription_executor,
-                    transcribe_bytes,
-                    model_or_repo, audio_bytes, ".wav", language, prompt,
-                ),
-                timeout=INFERENCE_TIMEOUT,
-            )
+            if USE_WHISPERX:
+                device = DEFAULT_DEVICE if DEFAULT_DEVICE != "auto" else "cpu"
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _transcription_executor,
+                        _transcribe_whisperx,
+                        model_or_repo, audio_bytes, language, prompt,
+                        align, diarize, min_speakers, max_speakers, device,
+                    ),
+                    timeout=INFERENCE_TIMEOUT,
+                )
+            else:
+                text = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _transcription_executor,
+                        transcribe_bytes,
+                        model_or_repo, audio_bytes, ".wav", language, prompt,
+                    ),
+                    timeout=INFERENCE_TIMEOUT,
+                )
+                result = {"text": text, "segments": None, "language": language or "auto"}
+            return result
         except asyncio.TimeoutError:
             raise HTTPException(
                 status_code=504,
@@ -591,12 +766,17 @@ async def health():
     ready = model_pool.is_ready
     return {
         "status": "ready" if ready else "loading",
-        "backend": "mlx-whisper" if USE_MLX else "faster-whisper",
+        "backend": _backend_name,
         "default_model": DEFAULT_MODEL_SIZE,
         "loaded_models": model_pool.loaded_models,
         "device": "apple-silicon-gpu" if USE_MLX else DEFAULT_DEVICE,
         "compute_type": "mlx-float16" if USE_MLX else DEFAULT_COMPUTE_TYPE,
         "auth_required": REQUIRE_AUTH,
+        "features": {
+            "diarization": USE_WHISPERX and bool(DIARIZE_HF_TOKEN),
+            "word_alignment": USE_WHISPERX,
+            "streaming": True,
+        },
         "concurrency": {
             "max_workers": MAX_WORKERS,
             "max_queue": MAX_QUEUE,
@@ -705,17 +885,18 @@ async def transcribe_audio(
     audio: UploadFile = File(...),
     model_size: str = Query(DEFAULT_MODEL_SIZE),
     language: str = Query("auto"),
-    context: str = Query("", description="Previous transcript text passed as Whisper initial_prompt"),
+    context: str = Query("", description="Prior transcript text used as Whisper initial_prompt"),
+    diarize: bool = Query(False, description="Enable multi-speaker diarization (whisperX only)"),
+    align_words: bool = Query(True, description="Enable word-level timestamps (whisperX only)"),
+    min_speakers: int = Query(1, description="Minimum number of speakers for diarization"),
+    max_speakers: int = Query(10, description="Maximum number of speakers for diarization"),
     user: Optional[dict] = Depends(get_current_user),
 ):
-    """Stateless transcription endpoint — send any audio file, get text back.
+    """Stateless transcription — recommended endpoint for production and horizontal scaling.
 
-    This is the recommended endpoint for production use and horizontal scaling.
-    No session state is kept server-side; the caller supplies the full audio.
-    Accepts WAV (preferred), MP3, OGG, FLAC, M4A and most formats ffmpeg understands.
-
-    The optional ``context`` parameter (last few sentences of prior transcript)
-    is forwarded to Whisper as ``initial_prompt`` for better cross-sentence coherence.
+    Accepts WAV (preferred), MP3, OGG, FLAC, M4A and any format ffmpeg supports.
+    When the whisperX backend is active, also returns word-level segments with
+    speaker labels when ``diarize=true``.
     """
     _validate_model_size(model_size)
     audio_bytes = await audio.read()
@@ -725,11 +906,13 @@ async def transcribe_audio(
         raise HTTPException(status_code=413, detail=f"audio exceeds max size ({MAX_CHUNK_BYTES} bytes)")
 
     lang = language if language and language != "auto" else None
-    prompt = context.strip()[-500:] if context else ""
+    prompt = context.strip()[-500:] if context else None
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-    raw_text = await _run_transcription(model_or_repo, audio_bytes, lang, prompt)
-    text = _filter_hallucination(raw_text)
+    result = await _run_transcription(model_or_repo, audio_bytes, lang, prompt,
+                                      align=align_words, diarize=diarize,
+                                      min_speakers=min_speakers, max_speakers=max_speakers)
+    text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
 
     log.info("Transcribe (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
@@ -738,13 +921,17 @@ async def transcribe_audio(
     _log_activity("transcribe", user=user, model=model_size, language=language,
                   file_size_bytes=len(audio_bytes), processing_time_s=round(elapsed, 3),
                   text_length=len(text), client_ip=request.client.host if request.client else None)
-    return {
+    response: dict = {
         "text": text,
         "file_size_bytes": len(audio_bytes),
         "processing_time_s": round(elapsed, 3),
         "model": model_size,
-        "language": language,
+        "language": result.get("language") or language,
+        "backend": _backend_name,
     }
+    if result.get("segments") is not None:
+        response["segments"] = result["segments"]
+    return response
 
 
 @app.post("/api/session/{session_id}/transcribe")
@@ -754,6 +941,10 @@ async def transcribe_session(
     model_size: str = DEFAULT_MODEL_SIZE,
     language: str = "auto",
     prompt: str = "",
+    diarize: bool = Query(False),
+    align_words: bool = Query(True),
+    min_speakers: int = Query(1),
+    max_speakers: int = Query(10),
     user: Optional[dict] = Depends(get_current_user),
 ):
     """Concatenate all chunks for this session and transcribe as one audio.
@@ -774,8 +965,10 @@ async def transcribe_session(
 
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-    raw_text = await _run_transcription(model_or_repo, combined, lang, prompt or None)
-    text = _filter_hallucination(raw_text)
+    result = await _run_transcription(model_or_repo, combined, lang, prompt or None,
+                                      align=align_words, diarize=diarize,
+                                      min_speakers=min_speakers, max_speakers=max_speakers)
+    text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
 
     log.info("Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
@@ -785,15 +978,18 @@ async def transcribe_session(
                   language=language, chunks=num_chunks, file_size_bytes=file_size,
                   processing_time_s=round(elapsed, 3), text_length=len(text),
                   client_ip=request.client.host if request.client else None)
-    return {
+    response: dict = {
         "text": text,
         "chunks": num_chunks,
         "file_size_bytes": file_size,
         "processing_time_s": round(elapsed, 3),
         "model": model_size,
-        "language": language,
-        "prompt": prompt,
+        "language": result.get("language") or language,
+        "backend": _backend_name,
     }
+    if result.get("segments") is not None:
+        response["segments"] = result["segments"]
+    return response
 
 
 @app.post("/api/stream/utterance")
@@ -804,12 +1000,14 @@ async def stream_utterance(
     language: str = Query("auto"),
     context: str = Query(""),
     sequence: int = Query(0),
+    diarize: bool = Query(False),
     user: Optional[dict] = Depends(get_current_user),
 ):
     """Streaming VAD endpoint — transcribe one detected utterance and return immediately.
 
-    Thin wrapper around /api/transcribe that adds the ``sequence`` field for
-    client-side ordering of concurrent in-flight requests.
+    Thin wrapper around /api/transcribe with a ``sequence`` field for client-side ordering.
+    When whisperX is active, word-level alignment is always performed (adds ~50ms on CPU).
+    Speaker diarization is skipped for streaming (too slow per-utterance).
     """
     _validate_model_size(model_size)
     audio_bytes = await audio.read()
@@ -819,11 +1017,13 @@ async def stream_utterance(
         raise HTTPException(status_code=413, detail=f"utterance exceeds max size ({MAX_CHUNK_BYTES} bytes)")
 
     lang = language if language and language != "auto" else None
-    prompt = context.strip()[-500:] if context else ""
+    prompt = context.strip()[-500:] if context else None
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-    raw_text = await _run_transcription(model_or_repo, audio_bytes, lang, prompt)
-    text = _filter_hallucination(raw_text)
+    # For streaming utterances: skip diarization (latency) but keep word alignment
+    result = await _run_transcription(model_or_repo, audio_bytes, lang, prompt,
+                                      align=True, diarize=False)
+    text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
 
     log.info("Stream utterance seq=%d (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
@@ -832,81 +1032,17 @@ async def stream_utterance(
     _log_activity("stream_utterance", user=user, model=model_size, language=language,
                   file_size_bytes=len(audio_bytes), processing_time_s=round(elapsed, 3),
                   text_length=len(text), client_ip=request.client.host if request.client else None)
-    return {
+    response: dict = {
         "text": text,
         "sequence": sequence,
         "file_size_bytes": len(audio_bytes),
         "processing_time_s": round(elapsed, 3),
         "model": model_size,
-        "language": language,
+        "language": result.get("language") or language,
     }
-
-
-@app.post("/api/transcribe")
-async def transcribe_audio(
-    request: Request,
-    audio: UploadFile = File(...),
-    model_size: str = Query(DEFAULT_MODEL_SIZE),
-    language: str = Query("auto"),
-    prompt: str = Query(""),
-    user: Optional[dict] = Depends(get_current_user),
-):
-    """Single-shot transcription: upload a complete audio file and get text back."""
-    if model_size not in ALLOWED_MODELS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"invalid model_size '{model_size}', must be one of {sorted(ALLOWED_MODELS)}",
-        )
-    audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="empty audio file")
-    if len(audio_bytes) > MAX_CHUNK_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"file exceeds max size ({MAX_CHUNK_BYTES} bytes)",
-        )
-
-    # Guess suffix from content type or filename
-    suffix = ".wav"
-    if audio.content_type and "webm" in audio.content_type:
-        suffix = ".webm"
-    elif audio.filename and "." in audio.filename:
-        suffix = "." + audio.filename.rsplit(".", 1)[-1]
-
-    model_or_repo = await model_pool.get(model_size)
-    t0 = time.monotonic()
-
-    loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(
-        _transcription_executor,
-        transcribe_bytes,
-        model_or_repo, audio_bytes, suffix, language, prompt,
-    )
-
-    elapsed = time.monotonic() - t0
-    log.info(
-        "Transcribed single file (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
-        len(audio_bytes), elapsed, model_size, language,
-        (user or {}).get("email", "anonymous"),
-    )
-    _log_activity(
-        "transcribe",
-        user=user,
-        model=model_size,
-        language=language,
-        file_size_bytes=len(audio_bytes),
-        processing_time_s=round(elapsed, 3),
-        text_length=len(text),
-        client_ip=request.client.host if request.client else None,
-    )
-    return {
-        "text": text,
-        "file_size_bytes": len(audio_bytes),
-        "processing_time_s": round(elapsed, 3),
-        "model": model_size,
-        "language": language,
-        "prompt": prompt,
-    }
+    if result.get("segments") is not None:
+        response["segments"] = result["segments"]
+    return response
 
 
 

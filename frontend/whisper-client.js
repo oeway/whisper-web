@@ -75,6 +75,10 @@ export class WhisperClient {
     this.model = options.model || 'small';
     this.language = options.language || 'auto';
     this.prompt = options.prompt || '';
+    this.diarize = options.diarize || false;
+    this.alignWords = options.alignWords || false;
+    this.minSpeakers = options.minSpeakers || 1;
+    this.maxSpeakers = options.maxSpeakers || 10;
 
     // Callbacks
     /** @type {((info: {chunks: number, totalBytes: number}) => void) | null} */
@@ -257,6 +261,10 @@ export class WhisperClient {
       model_size: this.model,
       language: this.language,
       prompt: this.prompt,
+      diarize: this.diarize,
+      align_words: this.alignWords,
+      min_speakers: this.minSpeakers,
+      max_speakers: this.maxSpeakers,
     });
 
     const resp = await fetch(`${this.server}/api/session/${this._sessionId}/transcribe?${params}`, {
@@ -288,6 +296,10 @@ export class WhisperClient {
       model_size: this.model,
       language: this.language,
       prompt: this.prompt,
+      diarize: this.diarize,
+      align_words: this.alignWords,
+      min_speakers: this.minSpeakers,
+      max_speakers: this.maxSpeakers,
     });
 
     this._setStatus('transcribing');

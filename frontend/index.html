@@ -49,6 +49,14 @@
           </div>
           <span class="text-slate-300">Live stream</span>
         </label>
+        <label id="diarizeLabel" class="hidden flex items-center gap-2 cursor-pointer select-none" title="Identify who spoke each segment (requires whisperX + HF token)">
+          <div class="relative">
+            <input type="checkbox" id="diarizeToggle" class="sr-only peer" />
+            <div class="w-10 h-5 bg-slate-700 peer-checked:bg-violet-500 rounded-full transition-colors"></div>
+            <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-5"></div>
+          </div>
+          <span class="text-slate-300">Speakers</span>
+        </label>
       </div>
     </header>
 
@@ -153,7 +161,9 @@ const statChunks      = document.getElementById('statChunks');
 const statFileSize    = document.getElementById('statFileSize');
 const statProcessTime = document.getElementById('statProcessTime');
 const statModel       = document.getElementById('statModel');
-const authBanner = document.getElementById('authBanner');
+const authBanner    = document.getElementById('authBanner');
+const diarizeLabel  = document.getElementById('diarizeLabel');
+const diarizeToggle = document.getElementById('diarizeToggle');
 
 const urlToken = new URLSearchParams(window.location.search).get('token') || '';
 
@@ -165,10 +175,27 @@ const client = new WhisperClient({
   prompt: promptInput.value,
 });
 
-// ---- Auth check on load ----
+// Speaker color palette — up to 8 distinct speakers
+const SPEAKER_COLORS = [
+  'text-emerald-300', 'text-sky-300', 'text-violet-300', 'text-amber-300',
+  'text-rose-300',    'text-cyan-300', 'text-lime-300',  'text-fuchsia-300',
+];
+const _speakerIndex = {};
+function speakerColor(label) {
+  if (!(label in _speakerIndex)) {
+    _speakerIndex[label] = Object.keys(_speakerIndex).length % SPEAKER_COLORS.length;
+  }
+  return SPEAKER_COLORS[_speakerIndex[label]];
+}
+
+// ---- Auth + feature detection on load ----
 (async () => {
   try {
     const data = await client.getHealth();
+    // Show speaker diarization toggle only when backend supports it
+    if (data.features?.diarization) {
+      diarizeLabel.classList.remove('hidden');
+    }
     if (data.auth_required && !urlToken) {
       authBanner.classList.remove('hidden');
       micBtn.disabled = true;
@@ -242,14 +269,48 @@ function showStats(data) {
   statsEl.classList.remove('hidden');
 }
 
+// ---- Segment/speaker rendering ----
+function renderSegments(segments, container) {
+  if (!segments || segments.length === 0) return;
+  // Group consecutive segments by speaker
+  let lastSpeaker = null;
+  segments.forEach(seg => {
+    const speaker = seg.speaker || null;
+    const text = (seg.text || '').trim();
+    if (!text) return;
+    const div = document.createElement('div');
+    div.className = 'flex gap-2 items-start mb-1';
+    if (speaker && speaker !== lastSpeaker) {
+      const color = speakerColor(speaker);
+      div.innerHTML = `<span class="text-xs font-mono mt-1 shrink-0 ${color}">${speaker}</span><span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>`;
+      lastSpeaker = speaker;
+    } else if (speaker) {
+      div.innerHTML = `<span class="text-xs font-mono mt-1 shrink-0 opacity-0">${speaker}</span><span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>`;
+    } else {
+      div.innerHTML = `<span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>`;
+    }
+    container.appendChild(div);
+  });
+}
+
 // ---- Streaming helpers ----
-function addStreamLine(text, seq, processingTime) {
+function addStreamLine(text, seq, processingTime, segments) {
   const line = document.createElement('div');
-  line.className = 'flex gap-2 items-start';
-  line.innerHTML = `
-    <span class="text-xs text-slate-500 font-mono mt-1 shrink-0">[${seq}]</span>
-    <span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>
-    <span class="text-xs text-slate-600 font-mono mt-1 ml-auto shrink-0">${processingTime.toFixed(2)}s</span>`;
+  line.className = 'border-b border-slate-800/50 pb-2 mb-1';
+  if (segments && segments.length > 0) {
+    const hdr = document.createElement('div');
+    hdr.className = 'flex gap-2 items-center mb-1';
+    hdr.innerHTML = `<span class="text-xs text-slate-500 font-mono">[${seq}]</span><span class="text-xs text-slate-600 font-mono ml-auto">${processingTime.toFixed(2)}s</span>`;
+    line.appendChild(hdr);
+    renderSegments(segments, line);
+  } else {
+    line.innerHTML = `
+      <div class="flex gap-2 items-start">
+        <span class="text-xs text-slate-500 font-mono mt-1 shrink-0">[${seq}]</span>
+        <span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>
+        <span class="text-xs text-slate-600 font-mono mt-1 ml-auto shrink-0">${processingTime.toFixed(2)}s</span>
+      </div>`;
+  }
   streamLines.appendChild(line);
   streamLines.scrollTop = streamLines.scrollHeight;
 }
@@ -309,7 +370,12 @@ micBtn.addEventListener('click', async () => {
       try {
         const result = await client.stopRecording();
         if (result.text) {
-          transcriptEl.textContent = result.text;
+          if (result.segments && result.segments.length > 0) {
+            transcriptEl.textContent = '';
+            renderSegments(result.segments, transcriptEl);
+          } else {
+            transcriptEl.textContent = result.text;
+          }
           showStats(result);
         } else {
           transcriptEl.textContent = '(no speech detected)';
@@ -332,6 +398,10 @@ micBtn.addEventListener('click', async () => {
     client.model = modelSelect.value;
     client.language = langSelect.value;
     client.prompt = promptInput.value;
+
+    // Sync diarize/alignment options from UI
+    client.diarize = diarizeToggle.checked;
+    client.alignWords = diarizeToggle.checked; // enable word alignment whenever diarize is on
 
     // Reset transcript area
     transcriptEl.textContent = '';
@@ -357,7 +427,7 @@ micBtn.addEventListener('click', async () => {
           chunkInfo.classList.remove('hidden');
           chunkInfo.textContent = `utterance ${r.sequence} · error`;
         } else {
-          if (text) addStreamLine(text, r.sequence, r.processing_time_s);
+          if (text || (r.segments && r.segments.length > 0)) addStreamLine(text, r.sequence, r.processing_time_s, r.segments);
           chunkInfo.classList.remove('hidden');
           chunkInfo.textContent = `utterance ${r.sequence} · ${r.processing_time_s?.toFixed(2)}s`;
         }

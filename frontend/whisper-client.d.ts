@@ -9,6 +9,22 @@ export interface WhisperClientOptions {
   language?: string;
   /** Optional initial prompt for Whisper. */
   prompt?: string;
+  /** Enable speaker diarization (requires whisperX backend + HF token). Default: false. */
+  diarize?: boolean;
+  /** Enable word-level alignment (requires whisperX backend). Default: false. */
+  alignWords?: boolean;
+  /** Minimum number of speakers for diarization. Default: 1. */
+  minSpeakers?: number;
+  /** Maximum number of speakers for diarization. Default: 10. */
+  maxSpeakers?: number;
+}
+
+export interface TranscriptSegment {
+  text: string;
+  start?: number;
+  end?: number;
+  speaker?: string;
+  words?: Array<{ word: string; start?: number; end?: number; score?: number }>;
 }
 
 export interface TranscriptionResult {
@@ -19,6 +35,8 @@ export interface TranscriptionResult {
   model: string;
   language: string;
   prompt: string;
+  /** Present when whisperX backend is used with align_words or diarize. */
+  segments?: TranscriptSegment[];
 }
 
 /** Result from a single utterance in streaming mode. */
@@ -31,6 +49,8 @@ export interface StreamUtteranceResult {
   processing_time_s: number;
   model: string;
   language: string;
+  /** Present when whisperX backend returns segment data. */
+  segments?: TranscriptSegment[];
 }
 
 /** Result returned by stopStreaming(). */
@@ -75,6 +95,14 @@ export class WhisperClient {
   language: string;
   /** Optional initial prompt. */
   prompt: string;
+  /** Enable speaker diarization. */
+  diarize: boolean;
+  /** Enable word-level alignment. */
+  alignWords: boolean;
+  /** Minimum speakers for diarization. */
+  minSpeakers: number;
+  /** Maximum speakers for diarization. */
+  maxSpeakers: number;
 
   /** Called after each chunk is uploaded to the server (batch mode). */
   onChunkUploaded: ((info: ChunkUploadInfo) => void) | null;
