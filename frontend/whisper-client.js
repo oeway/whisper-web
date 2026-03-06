@@ -159,7 +159,7 @@ export class WhisperClient {
    * @returns {Promise<object>}
    */
   async getHealth() {
-    const resp = await fetch(`${this.server}/health`);
+    const resp = await fetch(`${this.server}/api/health`);
     if (!resp.ok) throw new Error(`Health check failed: ${resp.status}`);
     return resp.json();
   }

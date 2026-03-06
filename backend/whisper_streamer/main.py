@@ -439,10 +439,11 @@ def _wx_get_diarize_pipeline(device: str):
                 "Set WHISPER_HF_TOKEN to a token with access to "
                 "pyannote/speaker-diarization-3.1."
             )
-        import whisperx
+        from whisperx.diarize import DiarizationPipeline
         log.info("Loading whisperX diarization pipeline...")
-        _wx_diarize_pipeline = whisperx.DiarizationPipeline(
-            use_auth_token=DIARIZE_HF_TOKEN, device=device
+        _wx_diarize_pipeline = DiarizationPipeline(
+            model_name="pyannote/speaker-diarization-3.1",
+            token=DIARIZE_HF_TOKEN, device=device
         )
         log.info("Diarization pipeline ready")
     return _wx_diarize_pipeline
@@ -762,6 +763,7 @@ async def sdk_info():
 
 
 @app.get("/health")
+@app.get("/api/health")
 async def health():
     ready = model_pool.is_ready
     return {
@@ -887,7 +889,7 @@ async def transcribe_audio(
     language: str = Query("auto"),
     context: str = Query("", description="Prior transcript text used as Whisper initial_prompt"),
     diarize: bool = Query(False, description="Enable multi-speaker diarization (whisperX only)"),
-    align_words: bool = Query(True, description="Enable word-level timestamps (whisperX only)"),
+    align_words: bool = Query(False, description="Enable word-level timestamps (whisperX only)"),
     min_speakers: int = Query(1, description="Minimum number of speakers for diarization"),
     max_speakers: int = Query(10, description="Maximum number of speakers for diarization"),
     user: Optional[dict] = Depends(get_current_user),
@@ -942,7 +944,7 @@ async def transcribe_session(
     language: str = "auto",
     prompt: str = "",
     diarize: bool = Query(False),
-    align_words: bool = Query(True),
+    align_words: bool = Query(False),
     min_speakers: int = Query(1),
     max_speakers: int = Query(10),
     user: Optional[dict] = Depends(get_current_user),
