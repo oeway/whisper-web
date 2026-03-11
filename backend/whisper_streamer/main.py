@@ -9,6 +9,7 @@ import time
 import traceback
 import logging
 import concurrent.futures
+import logging.handlers
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -65,7 +66,7 @@ log = logging.getLogger(__name__)
 
 _backend_name = (
     "mlx-whisper (Apple Silicon GPU)" if USE_MLX
-    else "whisperX (VAD+alignment+diarization)" if USE_WHISPERX
+    else "whisperX (VAD+alignment)" if USE_WHISPERX
     else "faster-whisper (CPU/CUDA)"
 )
 log.info("Whisper backend: %s", _backend_name)
@@ -78,8 +79,6 @@ DEFAULT_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float32")
 ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 MAX_CHUNK_BYTES = int(os.getenv("WHISPER_MAX_CHUNK_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 
-# whisperX/HF token for speaker diarization (pyannote.audio requires acceptance of terms)
-DIARIZE_HF_TOKEN = os.getenv("WHISPER_HF_TOKEN", "")
 WHISPERX_BATCH_SIZE = int(os.getenv("WHISPERX_BATCH_SIZE", "8"))
 
 # MLX uses Apple Metal GPU — not thread-safe, must run one inference at a time.
@@ -96,6 +95,8 @@ MAX_QUEUE = int(os.getenv("WHISPER_MAX_QUEUE", str(MAX_WORKERS * 8)))
 INFERENCE_TIMEOUT = float(os.getenv("WHISPER_INFERENCE_TIMEOUT", "120"))
 
 SESSION_TTL_SECONDS = int(os.getenv("WHISPER_SESSION_TTL", "600"))  # 10 minutes
+MAX_SESSIONS = int(os.getenv("WHISPER_MAX_SESSIONS", "200"))  # cap concurrent sessions
+MAX_ALIGN_LANGUAGES = 5  # cap cached alignment models to limit memory
 
 # Auth: set WHISPER_REQUIRE_AUTH=true to require Hypha token validation
 REQUIRE_AUTH = os.getenv("WHISPER_REQUIRE_AUTH", "").lower() in ("true", "1", "yes")
@@ -108,8 +109,10 @@ HYPHA_TOKEN_URL = os.getenv(
 _activity_log = logging.getLogger("whisper_activity")
 _activity_log.setLevel(logging.INFO)
 _activity_log.propagate = False
-_activity_handler = logging.FileHandler(
+_activity_handler = logging.handlers.RotatingFileHandler(
     os.getenv("WHISPER_ACTIVITY_LOG", "activity.jsonl"),
+    maxBytes=50 * 1024 * 1024,  # 50 MB per file
+    backupCount=3,
 )
 _activity_handler.setFormatter(logging.Formatter("%(message)s"))
 _activity_log.addHandler(_activity_handler)
@@ -284,15 +287,14 @@ def _concat_wav_chunks(chunks: List[bytes]) -> bytes:
     byte_rate = sample_rate * block_align
 
     # Collect PCM data from all chunks (skip 44-byte headers)
-    pcm_parts: List[bytes] = []
+    # Use a BytesIO buffer to avoid holding duplicate copies in memory
+    pcm_buf = io.BytesIO()
     for wav_bytes in chunks:
         if len(wav_bytes) > 44:
-            pcm_parts.append(wav_bytes[44:])
+            pcm_buf.write(wav_bytes[44:])
         else:
-            pcm_parts.append(wav_bytes)
-
-    pcm_data = b"".join(pcm_parts)
-    data_size = len(pcm_data)
+            pcm_buf.write(wav_bytes)
+    data_size = pcm_buf.tell()
 
     # Build new WAV header
     buf = io.BytesIO()
@@ -309,7 +311,8 @@ def _concat_wav_chunks(chunks: List[bytes]) -> bytes:
     buf.write(struct.pack("<H", bits_per_sample))
     buf.write(b"data")
     buf.write(struct.pack("<I", data_size))
-    buf.write(pcm_data)
+    buf.write(pcm_buf.getvalue())
+    pcm_buf.close()
     return buf.getvalue()
 
 
@@ -415,38 +418,32 @@ class ModelPool:
 
 
 # ---------------------------------------------------------------------------
-# whisperX engine — align models and diarization pipeline cached per process
+# whisperX engine — transcribe with optional word-level alignment
 # ---------------------------------------------------------------------------
 _wx_align_models: Dict[str, Any] = {}   # language_code → (model, metadata)
-_wx_diarize_pipeline: Optional[Any] = None
+_wx_align_lru: List[str] = []           # LRU order for alignment model eviction
 
 
 def _wx_get_align_model(language_code: str, device: str):
-    if language_code not in _wx_align_models:
-        import whisperx
-        log.info("Loading whisperX alignment model for language '%s'", language_code)
-        model_a, meta = whisperx.load_align_model(language_code=language_code, device=device)
-        _wx_align_models[language_code] = (model_a, meta)
+    if language_code in _wx_align_models:
+        # Move to end of LRU (most recently used)
+        if language_code in _wx_align_lru:
+            _wx_align_lru.remove(language_code)
+        _wx_align_lru.append(language_code)
+        return _wx_align_models[language_code]
+    import whisperx
+    # Evict least recently used if at capacity
+    while len(_wx_align_models) >= MAX_ALIGN_LANGUAGES and _wx_align_lru:
+        evict_lang = _wx_align_lru.pop(0)
+        removed = _wx_align_models.pop(evict_lang, None)
+        if removed is not None:
+            log.info("Evicted alignment model for language '%s' (LRU, cap=%d)", evict_lang, MAX_ALIGN_LANGUAGES)
+            del removed
+    log.info("Loading whisperX alignment model for language '%s'", language_code)
+    model_a, meta = whisperx.load_align_model(language_code=language_code, device=device)
+    _wx_align_models[language_code] = (model_a, meta)
+    _wx_align_lru.append(language_code)
     return _wx_align_models[language_code]
-
-
-def _wx_get_diarize_pipeline(device: str):
-    global _wx_diarize_pipeline
-    if _wx_diarize_pipeline is None:
-        if not DIARIZE_HF_TOKEN:
-            raise RuntimeError(
-                "Speaker diarization requires a HuggingFace token. "
-                "Set WHISPER_HF_TOKEN to a token with access to "
-                "pyannote/speaker-diarization-3.1."
-            )
-        from whisperx.diarize import DiarizationPipeline
-        log.info("Loading whisperX diarization pipeline...")
-        _wx_diarize_pipeline = DiarizationPipeline(
-            model_name="pyannote/speaker-diarization-3.1",
-            token=DIARIZE_HF_TOKEN, device=device
-        )
-        log.info("Diarization pipeline ready")
-    return _wx_diarize_pipeline
 
 
 def _transcribe_whisperx(
@@ -455,25 +452,20 @@ def _transcribe_whisperx(
     language: Optional[str],
     prompt: Optional[str],
     align: bool,
-    diarize: bool,
-    min_speakers: int,
-    max_speakers: int,
     device: str,
 ) -> dict:
-    """Full whisperX pipeline: transcribe → [align] → [diarize]."""
+    """whisperX pipeline: transcribe → [align]."""
     import whisperx, soundfile as sf
 
-    # WAV bytes → float32 numpy at native sample rate
     audio, sr = sf.read(io.BytesIO(audio_bytes))
     audio = audio.astype("float32")
     if audio.ndim > 1:
-        audio = audio.mean(axis=1)  # mix to mono
+        audio = audio.mean(axis=1)
 
     thread_name = threading.current_thread().name
     t0 = time.monotonic()
     log.info("whisperX transcribe start: %d bytes lang=%s thread=%s", len(audio_bytes), language, thread_name)
 
-    # Step 1: transcribe
     kwargs: dict = {"batch_size": WHISPERX_BATCH_SIZE}
     if language:
         kwargs["language"] = language
@@ -486,7 +478,6 @@ def _transcribe_whisperx(
     if not segments:
         return {"text": "", "segments": [], "language": detected_lang}
 
-    # Step 2: word-level alignment
     if align:
         try:
             t1 = time.monotonic()
@@ -498,26 +489,6 @@ def _transcribe_whisperx(
         except Exception as exc:
             log.warning("whisperX alignment failed (continuing without): %s", exc)
 
-    # Step 3: speaker diarization
-    if diarize:
-        try:
-            t2 = time.monotonic()
-            pipeline = _wx_get_diarize_pipeline(device)
-            diarize_kwargs: dict = {}
-            if min_speakers > 1:
-                diarize_kwargs["min_speakers"] = min_speakers
-            if max_speakers < 10:
-                diarize_kwargs["max_speakers"] = max_speakers
-            diarize_segs = pipeline(audio, **diarize_kwargs)
-            result_with_speakers = whisperx.assign_word_speakers(
-                diarize_segs, {"segments": segments}
-            )
-            segments = result_with_speakers["segments"]
-            log.info("whisperX diarize done: %.2fs", time.monotonic() - t2)
-        except Exception as exc:
-            log.warning("whisperX diarization failed (continuing without): %s", exc)
-
-    # Build flat text from segments
     text = " ".join(s.get("text", "").strip() for s in segments if s.get("text", "").strip())
     log.info("whisperX total: %.2fs text_len=%d", time.monotonic() - t0, len(text))
     return {"text": text, "segments": segments, "language": detected_lang}
@@ -594,9 +565,6 @@ async def _run_transcription(
     language: Optional[str],
     prompt: Optional[str],
     align: bool = True,
-    diarize: bool = False,
-    min_speakers: int = 1,
-    max_speakers: int = 10,
 ) -> dict:
     """Submit a transcription job to the thread pool with back-pressure and timeout.
 
@@ -626,7 +594,7 @@ async def _run_transcription(
                         _transcription_executor,
                         _transcribe_whisperx,
                         model_or_repo, audio_bytes, language, prompt,
-                        align, diarize, min_speakers, max_speakers, device,
+                        align, device,
                     ),
                     timeout=INFERENCE_TIMEOUT,
                 )
@@ -714,7 +682,9 @@ async def _unhandled_exception(request: Request, exc: Exception):
 def _log_server_stats():
     try:
         import resource as _resource
-        rss_mb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+        rss_raw = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        # macOS returns bytes, Linux returns KB
+        rss_mb = rss_raw / (1024 * 1024) if platform.system() == "Darwin" else rss_raw / 1024
     except Exception:
         rss_mb = -1
     executor = _transcription_executor
@@ -775,9 +745,8 @@ async def health():
         "compute_type": "mlx-float16" if USE_MLX else DEFAULT_COMPUTE_TYPE,
         "auth_required": REQUIRE_AUTH,
         "features": {
-            "diarization": USE_WHISPERX and bool(DIARIZE_HF_TOKEN),
-            "word_alignment": USE_WHISPERX,
             "streaming": True,
+            "word_alignment": USE_WHISPERX,
         },
         "concurrency": {
             "max_workers": MAX_WORKERS,
@@ -828,6 +797,11 @@ async def upload_chunk(
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="empty chunk")
     if session_id not in _sessions:
+        if len(_sessions) >= MAX_SESSIONS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many active sessions ({MAX_SESSIONS}). Retry later.",
+            )
         _sessions[session_id] = (time.monotonic(), [])
     ts, chunks = _sessions[session_id]
     total = sum(len(c) for c in chunks) + len(audio_bytes)
@@ -888,17 +862,12 @@ async def transcribe_audio(
     model_size: str = Query(DEFAULT_MODEL_SIZE),
     language: str = Query("auto"),
     context: str = Query("", description="Prior transcript text used as Whisper initial_prompt"),
-    diarize: bool = Query(False, description="Enable multi-speaker diarization (whisperX only)"),
-    align_words: bool = Query(False, description="Enable word-level timestamps (whisperX only)"),
-    min_speakers: int = Query(1, description="Minimum number of speakers for diarization"),
-    max_speakers: int = Query(10, description="Maximum number of speakers for diarization"),
     user: Optional[dict] = Depends(get_current_user),
 ):
     """Stateless transcription — recommended endpoint for production and horizontal scaling.
 
     Accepts WAV (preferred), MP3, OGG, FLAC, M4A and any format ffmpeg supports.
-    When the whisperX backend is active, also returns word-level segments with
-    speaker labels when ``diarize=true``.
+    When the whisperX backend is active, also returns word-level aligned segments.
     """
     _validate_model_size(model_size)
     audio_bytes = await audio.read()
@@ -911,9 +880,7 @@ async def transcribe_audio(
     prompt = context.strip()[-500:] if context else None
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-    result = await _run_transcription(model_or_repo, audio_bytes, lang, prompt,
-                                      align=align_words, diarize=diarize,
-                                      min_speakers=min_speakers, max_speakers=max_speakers)
+    result = await _run_transcription(model_or_repo, audio_bytes, lang, prompt)
     text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
 
@@ -943,10 +910,6 @@ async def transcribe_session(
     model_size: str = DEFAULT_MODEL_SIZE,
     language: str = "auto",
     prompt: str = "",
-    diarize: bool = Query(False),
-    align_words: bool = Query(False),
-    min_speakers: int = Query(1),
-    max_speakers: int = Query(10),
     user: Optional[dict] = Depends(get_current_user),
 ):
     """Concatenate all chunks for this session and transcribe as one audio.
@@ -955,7 +918,7 @@ async def transcribe_session(
     sticky sessions (sessionAffinity: ClientIP) or prefer /api/transcribe.
     """
     _validate_model_size(model_size)
-    entry = _sessions.pop(session_id, None)
+    entry = _sessions.get(session_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="no audio for this session")
     _, chunks = entry
@@ -967,11 +930,11 @@ async def transcribe_session(
 
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-    result = await _run_transcription(model_or_repo, combined, lang, prompt or None,
-                                      align=align_words, diarize=diarize,
-                                      min_speakers=min_speakers, max_speakers=max_speakers)
+    result = await _run_transcription(model_or_repo, combined, lang, prompt or None)
     text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
+    # Only remove session after successful transcription
+    _sessions.pop(session_id, None)
 
     log.info("Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
              num_chunks, file_size, elapsed, model_size, language,
@@ -994,6 +957,23 @@ async def transcribe_session(
     return response
 
 
+@app.delete("/api/session/{session_id}")
+async def delete_session(
+    session_id: str,
+    user: Optional[dict] = Depends(get_current_user),
+):
+    """Explicitly discard a session and free its memory."""
+    entry = _sessions.pop(session_id, None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    _, chunks = entry
+    num_chunks = len(chunks)
+    total_bytes = sum(len(c) for c in chunks)
+    del chunks, entry
+    log.info("Session %s deleted (%d chunks, %d bytes)", session_id, num_chunks, total_bytes)
+    return {"deleted": session_id, "chunks": num_chunks, "bytes_freed": total_bytes}
+
+
 @app.post("/api/stream/utterance")
 async def stream_utterance(
     request: Request,
@@ -1002,17 +982,12 @@ async def stream_utterance(
     language: str = Query("auto"),
     context: str = Query(""),
     sequence: int = Query(0),
-    diarize: bool = Query(False),
-    min_speakers: int = Query(1),
-    max_speakers: int = Query(10),
     user: Optional[dict] = Depends(get_current_user),
 ):
     """Streaming VAD endpoint — transcribe one detected utterance and return immediately.
 
     Thin wrapper around /api/transcribe with a ``sequence`` field for client-side ordering.
     When whisperX is active, word-level alignment is always performed (adds ~50ms on CPU).
-    Speaker diarization is optional — it adds ~1-3s latency per utterance but enables
-    real-time speaker labels in the response segments.
     """
     _validate_model_size(model_size)
     audio_bytes = await audio.read()
@@ -1026,9 +1001,7 @@ async def stream_utterance(
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
     result = await _run_transcription(model_or_repo, audio_bytes, lang, prompt,
-                                      align=True, diarize=diarize,
-                                      min_speakers=min_speakers,
-                                      max_speakers=max_speakers)
+                                      align=True)
     text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
 

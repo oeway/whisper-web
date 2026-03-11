@@ -8,7 +8,7 @@
  *    const client = new WhisperClient({ server: 'http://localhost:8000' });
  *    await client.startRecording();
  *    const result = await client.stopRecording();
- *    console.log(result.text, result.segments);
+ *    console.log(result.text);
  *    ```
  *
  * 2. **Live streaming** — real-time utterance-by-utterance transcription:
@@ -20,25 +20,7 @@
  *    const { text, utterances } = await client.stopStreaming();
  *    ```
  *
- * 3. **Live streaming with speaker detection** — real-time transcription + speaker labels:
- *    ```js
- *    const client = new WhisperClient({
- *      server: 'http://localhost:8000',
- *      diarize: true,         // enable speaker detection
- *      maxSpeakers: 4,        // expected max speakers
- *    });
- *    client.onTranscript = (r) => {
- *      for (const seg of r.segments || []) {
- *        console.log(`${seg.speaker}: ${seg.text}`);
- *      }
- *    };
- *    client.onSpeakerChange = (info) => {
- *      console.log(`Speaker changed: ${info.previous} → ${info.current}`);
- *    };
- *    await client.startStreaming();
- *    ```
- *
- * 4. **Single-shot transcription** — transcribe an existing audio file:
+ * 3. **Single-shot transcription** — transcribe an existing audio file:
  *    ```js
  *    const result = await client.transcribe(audioBlob);
  *    console.log(result.text);
@@ -111,10 +93,6 @@ export class WhisperClient {
     this.model = options.model || 'small';
     this.language = options.language || 'auto';
     this.prompt = options.prompt || '';
-    this.diarize = options.diarize || false;
-    this.alignWords = options.alignWords || false;
-    this.minSpeakers = options.minSpeakers || 1;
-    this.maxSpeakers = options.maxSpeakers || 10;
 
     // Callbacks
     /** @type {((info: {chunks: number, totalBytes: number}) => void) | null} */
@@ -123,15 +101,9 @@ export class WhisperClient {
     this.onStatusChange = null;
     /**
      * Streaming mode only. Called for each transcribed utterance.
-     * @type {((result: {text: string, sequence: number, processing_time_s: number, segments?: Array}) => void) | null}
+     * @type {((result: {text: string, sequence: number, processing_time_s: number}) => void) | null}
      */
     this.onTranscript = null;
-    /**
-     * Called when the detected speaker changes between utterances.
-     * Only fires when diarize is enabled.
-     * @type {((info: {previous: string|null, current: string, sequence: number}) => void) | null}
-     */
-    this.onSpeakerChange = null;
 
     // Internal state
     this._recording = false;
@@ -159,22 +131,18 @@ export class WhisperClient {
     this._totalBytesSent = 0;
 
     // Streaming mode state
-    this._streamPreRollBuffers = [];   // circular pre-roll buffer (audio before speech)
+    this._streamPreRollBuffers = [];
     this._streamPreRollLength = 0;
-    this._streamSpeechBuffers = [];    // current utterance audio
+    this._streamSpeechBuffers = [];
     this._streamSpeechLength = 0;
-    this._streamInSpeech = false;      // speech currently active
-    this._streamInUtterance = false;   // in utterance (speech + hangover)
+    this._streamInSpeech = false;
+    this._streamInUtterance = false;
     this._streamLastSpeech = 0;
     this._streamSequence = 0;
-    this._streamContext = '';          // accumulated transcript for Whisper prompt
-    this._streamAccumulated = '';      // full transcript returned by stopStreaming
+    this._streamContext = '';
+    this._streamAccumulated = '';
     this._streamTimer = null;
     this._streamSampleRate = 16000;
-
-    // Speaker tracking (streaming + diarize mode)
-    this._currentSpeaker = null;       // last detected speaker label
-    this._speakerHistory = [];         // [{speaker, sequence, text}]
   }
 
   /** Whether the client is currently recording (batch mode). */
@@ -185,16 +153,6 @@ export class WhisperClient {
   /** Whether the client is currently streaming (live utterance mode). */
   get streaming() {
     return this._streaming;
-  }
-
-  /** The last detected speaker label (null if diarization not active). */
-  get currentSpeaker() {
-    return this._currentSpeaker;
-  }
-
-  /** History of speaker changes: [{speaker, sequence, text}]. */
-  get speakerHistory() {
-    return this._speakerHistory;
   }
 
   // -- Auth header --
@@ -317,10 +275,6 @@ export class WhisperClient {
       model_size: this.model,
       language: this.language,
       prompt: this.prompt,
-      diarize: this.diarize,
-      align_words: this.alignWords,
-      min_speakers: this.minSpeakers,
-      max_speakers: this.maxSpeakers,
     });
 
     const resp = await fetch(`${this.server}/api/session/${this._sessionId}/transcribe?${params}`, {
@@ -352,10 +306,6 @@ export class WhisperClient {
       model_size: this.model,
       language: this.language,
       prompt: this.prompt,
-      diarize: this.diarize,
-      align_words: this.alignWords,
-      min_speakers: this.minSpeakers,
-      max_speakers: this.maxSpeakers,
     });
 
     this._setStatus('transcribing');
@@ -381,7 +331,7 @@ export class WhisperClient {
    * real time as the user speaks. Each completed utterance fires `onTranscript`.
    *
    * @param {object} [options]
-   * @param {number} [options.utteranceGapMs]   Silence gap (ms) that ends an utterance (default 1000)
+   * @param {number} [options.utteranceGapMs]   Silence gap (ms) that ends an utterance (default 1500)
    * @param {number} [options.maxUtteranceMs]   Max utterance length before forced flush (default 25000)
    * @returns {Promise<void>}
    */
@@ -398,9 +348,6 @@ export class WhisperClient {
     this._mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
     // Request 16 kHz directly — this is Whisper's native sample rate.
-    // The browser resamples from hardware rate (44100/48000 Hz) to 16000 Hz
-    // in high quality, eliminating the need for server-side ffmpeg resampling
-    // per utterance and significantly improving transcription quality.
     this._audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: STREAM_SAMPLE_RATE });
     this._streamSampleRate = this._audioCtx.sampleRate;
     this._sourceNode = this._audioCtx.createMediaStreamSource(this._mediaStream);
@@ -425,8 +372,6 @@ export class WhisperClient {
     this._streamAccumulated = '';
     this._noiseFloor = 0.004;
     this._vadWarmupUntil = performance.now() + DEFAULT_VAD_WARMUP_MS;
-    this._currentSpeaker = null;
-    this._speakerHistory = [];
 
     const maxUtteranceSamples = Math.ceil((maxUtteranceMs / 1000) * this._streamSampleRate);
 
@@ -450,7 +395,6 @@ export class WhisperClient {
       if (speaking) {
         this._streamLastSpeech = now;
         if (!this._streamInSpeech) {
-          // Speech onset: include pre-roll so we don't clip the utterance start
           this._streamSpeechBuffers = [...this._streamPreRollBuffers, copy];
           this._streamSpeechLength = this._streamPreRollLength + copy.length;
           this._streamPreRollBuffers = [];
@@ -463,11 +407,9 @@ export class WhisperClient {
         }
       } else {
         if (this._streamInUtterance) {
-          // Collect audio during hangover so we don't clip the utterance end
           this._streamSpeechBuffers.push(copy);
           this._streamSpeechLength += copy.length;
         } else {
-          // Maintain pre-roll ring buffer during silence
           this._streamPreRollBuffers.push(copy);
           this._streamPreRollLength += copy.length;
           if (this._streamPreRollBuffers.length > DEFAULT_STREAM_PRE_ROLL_CHUNKS) {
@@ -539,8 +481,6 @@ export class WhisperClient {
     return {
       text: this._streamAccumulated.trim(),
       utterances: this._streamSequence,
-      speakers: this.diarize ? [...new Set(this._speakerHistory.map(s => s.speaker))] : [],
-      speakerHistory: this.diarize ? this._speakerHistory : [],
     };
   }
 
@@ -609,11 +549,6 @@ export class WhisperClient {
       sequence: seq,
       context: this._streamContext,
     });
-    if (this.diarize) {
-      params.set('diarize', 'true');
-      params.set('min_speakers', this.minSpeakers);
-      params.set('max_speakers', this.maxSpeakers);
-    }
 
     try {
       const resp = await fetch(`${this.server}/api/stream/utterance?${params}`, {
@@ -627,19 +562,6 @@ export class WhisperClient {
         if (trimmed) {
           this._streamContext = (this._streamContext + ' ' + trimmed).trim().slice(-500);
           this._streamAccumulated = (this._streamAccumulated + ' ' + trimmed).trim();
-        }
-        // Track speaker changes when diarization is active
-        if (this.diarize && result.segments) {
-          for (const seg of result.segments) {
-            if (seg.speaker && seg.speaker !== this._currentSpeaker) {
-              const prev = this._currentSpeaker;
-              this._currentSpeaker = seg.speaker;
-              this._speakerHistory.push({ speaker: seg.speaker, sequence: seq, text: (seg.text || '').trim() });
-              if (this.onSpeakerChange) {
-                this.onSpeakerChange({ previous: prev, current: seg.speaker, sequence: seq });
-              }
-            }
-          }
         }
         if (this.onTranscript) this.onTranscript(result);
       } else {
