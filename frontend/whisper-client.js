@@ -31,7 +31,7 @@
 const DEFAULT_CHUNK_MS = 1500;
 const DEFAULT_VAD_THRESHOLD = 0.012;
 const DEFAULT_VAD_HANGOVER_MS = 800;
-const DEFAULT_VAD_WARMUP_MS = 3000;
+const DEFAULT_VAD_WARMUP_MS = 500;
 
 // -- Streaming VAD defaults --
 const DEFAULT_STREAM_UTTERANCE_GAP_MS = 1500;   // silence duration that ends an utterance
@@ -412,7 +412,9 @@ export class WhisperClient {
         } else {
           this._streamPreRollBuffers.push(copy);
           this._streamPreRollLength += copy.length;
-          if (this._streamPreRollBuffers.length > DEFAULT_STREAM_PRE_ROLL_CHUNKS) {
+          // During warmup, keep all buffers so no speech is lost.
+          // After warmup, cap pre-roll to avoid unbounded growth during silence.
+          if (!inWarmup && this._streamPreRollBuffers.length > DEFAULT_STREAM_PRE_ROLL_CHUNKS) {
             const evicted = this._streamPreRollBuffers.shift();
             this._streamPreRollLength -= evicted.length;
           }
@@ -550,21 +552,34 @@ export class WhisperClient {
       context: this._streamContext,
     });
 
-    try {
-      const resp = await fetch(`${this.server}/api/stream/utterance?${params}`, {
-        method: 'POST',
-        headers: this._authHeaders(),
-        body: form,
-      });
-      if (resp.ok) {
-        const result = await resp.json();
-        const trimmed = (result.text || '').trim();
-        if (trimmed) {
-          this._streamContext = (this._streamContext + ' ' + trimmed).trim().slice(-500);
-          this._streamAccumulated = (this._streamAccumulated + ' ' + trimmed).trim();
+    // Retry up to 2 times on transient failures (proxy/load-balancer issues
+    // can drop the multipart body, causing 422 "Field required").
+    const MAX_RETRIES = 2;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        // Re-create FormData on retry (body is consumed after first fetch)
+        const fd = new FormData();
+        fd.append('audio', wavBlob, 'utterance.wav');
+        const resp = await fetch(`${this.server}/api/stream/utterance?${params}`, {
+          method: 'POST',
+          headers: this._authHeaders(),
+          body: fd,
+        });
+        if (resp.ok) {
+          const result = await resp.json();
+          const trimmed = (result.text || '').trim();
+          if (trimmed) {
+            this._streamContext = (this._streamContext + ' ' + trimmed).trim().slice(-500);
+            this._streamAccumulated = (this._streamAccumulated + ' ' + trimmed).trim();
+          }
+          if (this.onTranscript) this.onTranscript(result);
+          return; // success
         }
-        if (this.onTranscript) this.onTranscript(result);
-      } else {
+        // Retry on 422 (proxy dropped body) or 502/503/504 (backend unavailable)
+        if (attempt < MAX_RETRIES && [422, 502, 503, 504].includes(resp.status)) {
+          console.warn(`[WhisperClient] seq=${seq} got ${resp.status}, retrying (${attempt + 1}/${MAX_RETRIES})...`);
+          continue;
+        }
         let detail = `HTTP ${resp.status}`;
         try {
           const j = await resp.json();
@@ -575,10 +590,16 @@ export class WhisperClient {
         } catch (_) {}
         console.error(`[WhisperClient] stream utterance seq=${seq} failed: ${detail}`);
         if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: detail });
+        return;
+      } catch (err) {
+        if (attempt < MAX_RETRIES) {
+          console.warn(`[WhisperClient] seq=${seq} network error, retrying (${attempt + 1}/${MAX_RETRIES})...`);
+          continue;
+        }
+        console.error(`[WhisperClient] stream utterance seq=${seq} network error:`, err);
+        if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: err.message });
+        return;
       }
-    } catch (err) {
-      console.error(`[WhisperClient] stream utterance seq=${seq} network error:`, err);
-      if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: err.message });
     }
   }
 
@@ -597,23 +618,30 @@ export class WhisperClient {
     const wavBlob = encodeWav(merged, this._audioCtx.sampleRate);
     if (wavBlob.size < 1200) return; // too tiny
 
-    const form = new FormData();
-    form.append('chunk', wavBlob, 'chunk.wav');
-    try {
-      const resp = await fetch(`${this.server}/api/session/${this._sessionId}/chunk`, {
-        method: 'POST',
-        headers: this._authHeaders(),
-        body: form,
-      });
-      if (resp.ok) {
-        this._chunksSent += 1;
-        this._totalBytesSent += wavBlob.size;
-        if (this.onChunkUploaded) {
-          this.onChunkUploaded({ chunks: this._chunksSent, totalBytes: this._totalBytesSent });
+    // Retry on transient proxy failures (422/502/503/504)
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        const fd = new FormData();
+        fd.append('chunk', wavBlob, 'chunk.wav');
+        const resp = await fetch(`${this.server}/api/session/${this._sessionId}/chunk`, {
+          method: 'POST',
+          headers: this._authHeaders(),
+          body: fd,
+        });
+        if (resp.ok) {
+          this._chunksSent += 1;
+          this._totalBytesSent += wavBlob.size;
+          if (this.onChunkUploaded) {
+            this.onChunkUploaded({ chunks: this._chunksSent, totalBytes: this._totalBytesSent });
+          }
+          return;
         }
+        if (attempt < 2 && [422, 502, 503, 504].includes(resp.status)) continue;
+        return; // non-retryable error
+      } catch (_) {
+        if (attempt < 2) continue;
+        // Network error — non-fatal, chunk is lost but recording continues
       }
-    } catch (_) {
-      // Network error — non-fatal, chunk is lost but recording continues
     }
   }
 }
