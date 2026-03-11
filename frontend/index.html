@@ -76,7 +76,12 @@
 
     <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 space-y-3">
       <div class="flex items-center justify-between">
-        <p class="text-sm text-slate-400">Transcript</p>
+        <div class="flex items-center gap-2">
+          <p class="text-sm text-slate-400">Transcript</p>
+          <button id="speakTranscriptBtn" class="hidden text-violet-400 hover:text-violet-300 transition" title="Send to TTS">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072M11 5L6 9H2v6h4l5 4V5z"/></svg>
+          </button>
+        </div>
         <div id="stats" class="hidden flex flex-wrap gap-x-4 gap-y-1 text-xs font-mono text-slate-500">
           <span id="statDuration"></span>
           <span id="statChunks"></span>
@@ -94,6 +99,49 @@
     <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 space-y-2">
       <label class="text-sm text-slate-400" for="prompt">Optional system prompt (sent to Whisper)</label>
       <textarea id="prompt" class="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400" rows="2" placeholder="e.g. Names: Alice, Bob. Domain: healthcare."></textarea>
+    </div>
+  </div>
+
+  <!-- Text-to-Speech Section -->
+  <div class="w-full max-w-3xl bg-slate-900/70 border border-slate-800 rounded-3xl shadow-2xl p-6 space-y-4">
+    <header class="flex items-center justify-between gap-4">
+      <div>
+        <p class="text-sm uppercase tracking-[0.25em] text-violet-300">Text-to-Speech</p>
+        <h2 class="text-xl font-semibold">Speak Text</h2>
+        <p class="text-slate-400 text-sm">Type or paste text, then click Speak to hear it. Or click the speaker icon on any transcript above.</p>
+      </div>
+      <div class="flex flex-col gap-2 text-sm">
+        <select id="ttsBackend" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-400">
+          <option value="edge-tts" selected>Edge TTS (Neural)</option>
+          <option value="gtts">Google TTS</option>
+        </select>
+        <select id="ttsLang" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-400">
+          <option value="en" selected>English</option>
+          <option value="es">Spanish</option>
+          <option value="fr">French</option>
+          <option value="de">German</option>
+          <option value="it">Italian</option>
+          <option value="ja">Japanese</option>
+          <option value="zh">Chinese</option>
+          <option value="ko">Korean</option>
+          <option value="pt">Portuguese</option>
+          <option value="ru">Russian</option>
+          <option value="ar">Arabic</option>
+          <option value="hi">Hindi</option>
+        </select>
+      </div>
+    </header>
+    <div class="flex gap-3">
+      <textarea id="ttsText" class="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-400 min-h-[80px]" rows="3" placeholder="Enter text to speak..."></textarea>
+    </div>
+    <div class="flex items-center gap-3">
+      <button id="ttsBtn" class="px-5 py-2.5 rounded-xl bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white font-semibold shadow-lg hover:scale-105 transition focus:outline-none focus:ring-4 focus:ring-violet-300/70 flex items-center gap-2">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072M17.95 6.05a8 8 0 010 11.9M11 5L6 9H2v6h4l5 4V5z"/></svg>
+        <span id="ttsBtnText">Speak</span>
+      </button>
+      <button id="ttsStop" class="hidden px-4 py-2.5 rounded-xl bg-slate-700 text-slate-300 font-semibold hover:bg-slate-600 transition">Stop</button>
+      <span id="ttsStatus" class="text-xs text-slate-500"></span>
+      <audio id="ttsAudio" class="hidden"></audio>
     </div>
   </div>
 
@@ -127,6 +175,15 @@ client.onTranscript = (r) => console.log(`[${r.sequence}] ${r.text}`);
 
 <span class="text-slate-500">// Option C: Transcribe an audio file directly</span>
 <span class="text-cyan-300">const</span> result2 = <span class="text-cyan-300">await</span> client.transcribe(audioBlob);
+
+<span class="text-slate-500">// Text-to-Speech — POST /api/tts</span>
+<span class="text-cyan-300">const</span> resp = <span class="text-cyan-300">await</span> fetch(<span class="text-emerald-300">'/api/tts'</span>, {
+  method: <span class="text-emerald-300">'POST'</span>,
+  headers: { <span class="text-emerald-300">'Content-Type'</span>: <span class="text-emerald-300">'application/json'</span> },
+  body: JSON.stringify({ text: <span class="text-emerald-300">'Hello world'</span>, language: <span class="text-emerald-300">'en'</span>, backend: <span class="text-emerald-300">'edge-tts'</span> }),
+});
+<span class="text-cyan-300">const</span> audio = <span class="text-cyan-300">new</span> Audio(URL.createObjectURL(<span class="text-cyan-300">await</span> resp.blob()));
+audio.play();
 
 <span class="text-slate-500">// Cleanup when done</span>
 client.destroy();</code></pre>
@@ -355,7 +412,8 @@ micBtn.addEventListener('click', async () => {
         if (r.error) {
           const errLine = document.createElement('div');
           errLine.className = 'flex gap-2 items-start';
-          errLine.innerHTML = `<span class="text-xs text-slate-500 font-mono mt-1 shrink-0">[${r.sequence}]</span><span class="text-sm text-red-400 italic">${r.error}</span>`;
+          const errMsg = typeof r.error === 'string' ? r.error : JSON.stringify(r.error);
+          errLine.innerHTML = `<span class="text-xs text-slate-500 font-mono mt-1 shrink-0">[${r.sequence}]</span><span class="text-sm text-red-400 italic">${errMsg}</span>`;
           streamLines.appendChild(errLine);
           streamLines.scrollTop = streamLines.scrollHeight;
           chunkInfo.classList.remove('hidden');
@@ -396,6 +454,120 @@ micBtn.addEventListener('click', async () => {
     streamToggle.disabled = true;
   }
 
+});
+
+// ---- TTS ----
+const ttsBtn      = document.getElementById('ttsBtn');
+const ttsBtnText  = document.getElementById('ttsBtnText');
+const ttsStop     = document.getElementById('ttsStop');
+const ttsText     = document.getElementById('ttsText');
+const ttsBackend  = document.getElementById('ttsBackend');
+const ttsLang     = document.getElementById('ttsLang');
+const ttsStatus   = document.getElementById('ttsStatus');
+const ttsAudio    = document.getElementById('ttsAudio');
+
+let ttsPlaying = false;
+
+async function speakText(text, lang, backend) {
+  if (!text.trim()) return;
+  ttsPlaying = true;
+  ttsBtnText.textContent = 'Generating...';
+  ttsBtn.disabled = true;
+  ttsBtn.style.opacity = 0.5;
+  ttsStatus.textContent = '';
+
+  try {
+    const t0 = performance.now();
+    const resp = await fetch('/api/tts', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(urlToken ? { 'Authorization': `Bearer ${urlToken}` } : {}),
+      },
+      body: JSON.stringify({ text, language: lang, backend }),
+    });
+
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try { const j = await resp.json(); detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch (_) {}
+      throw new Error(detail);
+    }
+
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    ttsAudio.src = url;
+
+    const processingTime = resp.headers.get('X-TTS-Processing-Time') || ((performance.now() - t0) / 1000).toFixed(3);
+    const ttsBackendUsed = resp.headers.get('X-TTS-Backend') || backend;
+    ttsStatus.textContent = `${ttsBackendUsed} · ${formatBytes(blob.size)} · ${processingTime}s`;
+
+    ttsStop.classList.remove('hidden');
+    ttsBtnText.textContent = 'Playing...';
+
+    ttsAudio.onended = () => {
+      ttsPlaying = false;
+      ttsBtnText.textContent = 'Speak';
+      ttsBtn.disabled = false;
+      ttsBtn.style.opacity = 1;
+      ttsStop.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    };
+    ttsAudio.onerror = () => {
+      ttsPlaying = false;
+      ttsBtnText.textContent = 'Speak';
+      ttsBtn.disabled = false;
+      ttsBtn.style.opacity = 1;
+      ttsStop.classList.add('hidden');
+      ttsStatus.textContent = 'Playback error';
+      URL.revokeObjectURL(url);
+    };
+
+    await ttsAudio.play();
+  } catch (e) {
+    ttsStatus.textContent = `Error: ${e.message}`;
+    ttsPlaying = false;
+    ttsBtnText.textContent = 'Speak';
+    ttsBtn.disabled = false;
+    ttsBtn.style.opacity = 1;
+    ttsStop.classList.add('hidden');
+  }
+}
+
+ttsBtn.addEventListener('click', () => {
+  speakText(ttsText.value, ttsLang.value, ttsBackend.value);
+});
+
+ttsStop.addEventListener('click', () => {
+  ttsAudio.pause();
+  ttsAudio.currentTime = 0;
+  ttsPlaying = false;
+  ttsBtnText.textContent = 'Speak';
+  ttsBtn.disabled = false;
+  ttsBtn.style.opacity = 1;
+  ttsStop.classList.add('hidden');
+});
+
+// Auto-populate TTS text from transcript
+function copyToTTS(text) {
+  ttsText.value = text;
+  ttsText.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  ttsText.focus();
+}
+
+// Speak button next to transcript header
+const speakTranscriptBtn = document.getElementById('speakTranscriptBtn');
+
+// Show speak button when transcript has content
+const _transcriptObserver = new MutationObserver(() => {
+  const hasText = transcriptEl.textContent.trim() && !transcriptEl.textContent.startsWith('Error') && !transcriptEl.textContent.startsWith('(');
+  speakTranscriptBtn.classList.toggle('hidden', !hasText);
+});
+_transcriptObserver.observe(transcriptEl, { childList: true, characterData: true, subtree: true });
+
+speakTranscriptBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const text = transcriptEl.textContent.trim();
+  if (text) speakText(text, ttsLang.value, ttsBackend.value);
 });
 
 </script>

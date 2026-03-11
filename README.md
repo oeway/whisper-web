@@ -1,8 +1,8 @@
 # Whisper Web
 
-Web-based voice transcription powered by OpenAI's Whisper. Record audio in your browser, get transcripts back in seconds.
+Web-based voice transcription and text-to-speech powered by OpenAI's Whisper. Record audio in your browser, get transcripts back in seconds — then speak them back with neural TTS.
 
-Supports **batch recording**, **live streaming transcription**, and **single-shot file transcription**. Runs on **Apple Silicon GPUs** (via MLX), **Linux with CUDA** (via faster-whisper/whisperX), or CPU.
+Supports **batch recording**, **live streaming transcription**, **single-shot file transcription**, and **text-to-speech** (via Edge TTS / Google TTS). Runs on **Apple Silicon GPUs** (via MLX), **Linux with CUDA** (via faster-whisper/whisperX), or CPU.
 
 ## Quick Start
 
@@ -70,6 +70,10 @@ Environment variables:
 | `WHISPER_REQUIRE_AUTH` | `false` | Require Hypha token for all API requests |
 | `HYPHA_TOKEN_URL` | `https://hypha.aicell.io/public/services/ws/parse_token` | Hypha token validation endpoint |
 | `WHISPER_ACTIVITY_LOG` | `activity.jsonl` | Path to the JSON Lines activity log |
+| `TTS_BACKEND` | `edge-tts` | Default TTS backend (`edge-tts` or `gtts`) |
+| `TTS_VOICE` | `en-US-AriaNeural` | Default edge-tts voice |
+| `TTS_MAX_TEXT_LENGTH` | `5000` | Max characters per TTS request |
+| `TTS_MAX_CONCURRENT` | `8` | Max concurrent TTS requests |
 
 Example:
 
@@ -191,6 +195,36 @@ Concatenate all uploaded chunks for this session and transcribe as one audio. Co
 
 **Response:** same as `/api/transcribe`, plus `"chunks": 3`.
 
+### `POST /api/tts` (text-to-speech)
+
+Convert text to speech audio (MP3). Two backends are supported:
+
+- **edge-tts** (default): Microsoft Edge neural voices — high quality, many languages
+- **gtts**: Google Translate TTS — simpler, fewer options
+
+**Body** (JSON):
+
+| Field | Default | Description |
+|---|---|---|
+| `text` | *(required)* | Text to synthesize |
+| `language` | `en` | Language code (`en`, `zh`, `ja`, etc.) |
+| `backend` | `edge-tts` | TTS engine: `edge-tts` or `gtts` |
+| `voice` | *(auto)* | Edge-tts voice name (e.g. `en-US-GuyNeural`) |
+| `slow` | `false` | Slow speech (gtts only) |
+
+**Response:** `audio/mpeg` stream (MP3). Headers include `X-TTS-Backend` and `X-TTS-Processing-Time`.
+
+```bash
+curl -X POST "http://localhost:8000/api/tts" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world", "language": "en", "backend": "edge-tts"}' \
+  --output speech.mp3
+```
+
+### `GET /api/tts/voices`
+
+List all available edge-tts voices with metadata.
+
 ### `GET /api/health`
 
 Returns server status and feature flags.
@@ -269,6 +303,20 @@ Transcribe an existing audio file (Blob, File, or fetch response).
 ```js
 const result = await client.transcribe(audioBlob, 'meeting.wav');
 console.log(result.text);
+```
+
+### Text-to-Speech
+
+Convert text to speech using the TTS API (no SDK class needed — it's a simple fetch):
+
+```js
+const resp = await fetch('/api/tts', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ text: 'Hello world', language: 'en', backend: 'edge-tts' }),
+});
+const audio = new Audio(URL.createObjectURL(await resp.blob()));
+audio.play();
 ```
 
 ### Properties & Callbacks

@@ -566,7 +566,13 @@ export class WhisperClient {
         if (this.onTranscript) this.onTranscript(result);
       } else {
         let detail = `HTTP ${resp.status}`;
-        try { const j = await resp.json(); detail = j.detail || detail; } catch (_) {}
+        try {
+          const j = await resp.json();
+          const d = j.detail;
+          if (typeof d === 'string') detail = d;
+          else if (Array.isArray(d)) detail = d.map(e => e.msg || JSON.stringify(e)).join('; ');
+          else if (d) detail = JSON.stringify(d);
+        } catch (_) {}
         console.error(`[WhisperClient] stream utterance seq=${seq} failed: ${detail}`);
         if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: detail });
       }

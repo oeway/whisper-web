@@ -467,6 +467,134 @@ def run_tests(server: str):
     except Exception as e:
         results.fail("context chaining", str(e))
 
+    # -----------------------------------------------------------------------
+    # 6. Text-to-Speech (TTS)
+    # -----------------------------------------------------------------------
+    print("\n[Text-to-Speech]")
+
+    # 6a. Edge-tts basic
+    try:
+        t0 = time.monotonic()
+        r = client.post(
+            "/api/tts",
+            json={"text": "Hello world, this is a test of text to speech.",
+                  "language": "en", "backend": "edge-tts"},
+        )
+        elapsed = time.monotonic() - t0
+        r.raise_for_status()
+        content_type = r.headers.get("content-type", "")
+        tts_backend = r.headers.get("x-tts-backend", "unknown")
+        if "audio" in content_type and len(r.content) > 1000:
+            results.ok("edge-tts basic",
+                       f"{len(r.content)} bytes MP3 in {elapsed:.2f}s (backend={tts_backend})")
+        else:
+            results.fail("edge-tts basic",
+                         f"unexpected: content-type={content_type}, size={len(r.content)}")
+    except Exception as e:
+        results.fail("edge-tts basic", str(e))
+
+    # 6b. gTTS basic
+    try:
+        t0 = time.monotonic()
+        r = client.post(
+            "/api/tts",
+            json={"text": "Testing Google text to speech engine.",
+                  "language": "en", "backend": "gtts"},
+        )
+        elapsed = time.monotonic() - t0
+        r.raise_for_status()
+        content_type = r.headers.get("content-type", "")
+        if "audio" in content_type and len(r.content) > 1000:
+            results.ok("gtts basic",
+                       f"{len(r.content)} bytes MP3 in {elapsed:.2f}s")
+        else:
+            results.fail("gtts basic",
+                         f"unexpected: content-type={content_type}, size={len(r.content)}")
+    except Exception as e:
+        results.fail("gtts basic", str(e))
+
+    # 6c. Edge-tts multi-language
+    for lang, text in [("es", "Hola mundo"), ("fr", "Bonjour le monde"),
+                       ("ja", "こんにちは世界"), ("zh", "你好世界")]:
+        try:
+            r = client.post("/api/tts",
+                            json={"text": text, "language": lang, "backend": "edge-tts"})
+            r.raise_for_status()
+            if len(r.content) > 500:
+                results.ok(f"edge-tts {lang}", f"{len(r.content)} bytes")
+            else:
+                results.fail(f"edge-tts {lang}", f"too small: {len(r.content)} bytes")
+        except Exception as e:
+            results.fail(f"edge-tts {lang}", str(e))
+
+    # 6d. Empty text (should return 400)
+    try:
+        r = client.post("/api/tts", json={"text": "", "language": "en"})
+        if r.status_code == 400:
+            results.ok("tts empty text", "correctly returned 400")
+        else:
+            results.fail("tts empty text", f"expected 400, got {r.status_code}")
+    except Exception as e:
+        results.fail("tts empty text", str(e))
+
+    # 6e. Invalid backend (should return 400)
+    try:
+        r = client.post("/api/tts",
+                        json={"text": "test", "language": "en", "backend": "invalid"})
+        if r.status_code == 400:
+            results.ok("tts invalid backend", "correctly returned 400")
+        else:
+            results.fail("tts invalid backend", f"expected 400, got {r.status_code}")
+    except Exception as e:
+        results.fail("tts invalid backend", str(e))
+
+    # 6f. Text too long (should return 413)
+    try:
+        r = client.post("/api/tts",
+                        json={"text": "x" * 6000, "language": "en"})
+        if r.status_code == 413:
+            results.ok("tts text too long", "correctly returned 413")
+        else:
+            results.fail("tts text too long", f"expected 413, got {r.status_code}")
+    except Exception as e:
+        results.fail("tts text too long", str(e))
+
+    # 6g. List voices
+    try:
+        r = client.get("/api/tts/voices")
+        r.raise_for_status()
+        data = r.json()
+        count = data.get("count", 0)
+        if count > 50:
+            results.ok("tts list voices", f"{count} voices available")
+        else:
+            results.fail("tts list voices", f"expected >50 voices, got {count}")
+    except Exception as e:
+        results.fail("tts list voices", str(e))
+
+    # 6h. Round-trip: transcribe → TTS (speech-to-text-to-speech)
+    try:
+        # Transcribe
+        test_wav = synthesize_speech_wav("The weather is beautiful today.")
+        r = client.post(
+            "/api/transcribe",
+            params={"model_size": "tiny", "language": "en"},
+            files={"audio": ("rt.wav", test_wav, "audio/wav")},
+        )
+        r.raise_for_status()
+        transcript = r.json()["text"]
+        # TTS the transcript
+        r = client.post("/api/tts",
+                        json={"text": transcript, "language": "en", "backend": "edge-tts"})
+        r.raise_for_status()
+        if len(r.content) > 1000:
+            results.ok("round-trip STT→TTS",
+                       f"'{transcript[:50]}' → {len(r.content)} bytes MP3")
+        else:
+            results.fail("round-trip STT→TTS", f"TTS output too small: {len(r.content)}")
+    except Exception as e:
+        results.fail("round-trip STT→TTS", str(e))
+
     return results
 
 

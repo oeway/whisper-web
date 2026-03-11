@@ -13,15 +13,15 @@ dependencies = [
   "uvicorn[standard]>=0.30.0",
   "python-multipart>=0.0.9",
   "httpx>=0.27.0",
+  "gtts>=2.5.0",
+  "edge-tts>=6.1.0",
 ]
 
 [project.optional-dependencies]
 apple = ["mlx-whisper>=0.4.0"]
 cuda = ["faster-whisper>=1.0.3"]
 cpu = ["faster-whisper>=1.0.3"]
-# whisperX adds VAD, word-level alignment and speaker diarization.
-# Requires ffmpeg. Diarization requires WHISPER_HF_TOKEN with access to
-# pyannote/speaker-diarization-3.1 on HuggingFace.
+# whisperX adds VAD, word-level alignment.
 whisperx = ["whisperx>=3.1.1", "soundfile>=0.12.1"]
 dev = ["pytest", "ruff"]
 

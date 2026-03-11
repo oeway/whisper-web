@@ -17,8 +17,9 @@ from typing import Dict, List, Optional, Any, Tuple
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile, Query, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1025,173 @@ async def stream_utterance(
     return response
 
 
+
+
+# ---------------------------------------------------------------------------
+# Text-to-Speech (TTS) endpoint
+# Supports two backends: edge-tts (Microsoft, higher quality) and gTTS (Google)
+# ---------------------------------------------------------------------------
+TTS_MAX_TEXT_LENGTH = int(os.getenv("TTS_MAX_TEXT_LENGTH", "5000"))
+TTS_DEFAULT_BACKEND = os.getenv("TTS_BACKEND", "edge-tts")  # "edge-tts" or "gtts"
+TTS_DEFAULT_VOICE = os.getenv("TTS_VOICE", "en-US-AriaNeural")  # edge-tts voice
+_tts_active: int = 0  # back-pressure counter
+TTS_MAX_CONCURRENT = int(os.getenv("TTS_MAX_CONCURRENT", "8"))
+TTS_TIMEOUT = float(os.getenv("TTS_TIMEOUT", "30"))
+
+
+class TTSRequest(BaseModel):
+    text: str
+    language: str = "en"
+    backend: str = ""  # "" = use default; "edge-tts" or "gtts"
+    voice: str = ""  # edge-tts voice name (ignored for gtts)
+    slow: bool = False  # gtts only: slow speech
+
+
+# edge-tts voice mapping for common language codes
+_EDGE_TTS_VOICES: Dict[str, str] = {
+    "en": "en-US-AriaNeural",
+    "es": "es-ES-ElviraNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "de": "de-DE-KatjaNeural",
+    "it": "it-IT-ElsaNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ko": "ko-KR-SunHiNeural",
+    "pt": "pt-BR-FranciscaNeural",
+    "ru": "ru-RU-SvetlanaNeural",
+    "ar": "ar-SA-ZariyahNeural",
+    "hi": "hi-IN-SwaraNeural",
+}
+
+
+def _edge_tts_voice_for_lang(language: str) -> str:
+    """Return a suitable edge-tts voice for the given language code."""
+    lang = language.lower().strip()
+    if lang in _EDGE_TTS_VOICES:
+        return _EDGE_TTS_VOICES[lang]
+    # Try prefix match (e.g. "en-US" → "en")
+    prefix = lang.split("-")[0]
+    if prefix in _EDGE_TTS_VOICES:
+        return _EDGE_TTS_VOICES[prefix]
+    return TTS_DEFAULT_VOICE
+
+
+async def _synthesize_edge_tts(text: str, voice: str) -> bytes:
+    """Generate MP3 audio using Microsoft Edge TTS."""
+    import edge_tts
+    communicate = edge_tts.Communicate(text, voice)
+    buf = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
+    return buf.getvalue()
+
+
+def _synthesize_gtts(text: str, language: str, slow: bool) -> bytes:
+    """Generate MP3 audio using Google TTS (blocking)."""
+    from gtts import gTTS
+    tts = gTTS(text=text, lang=language, slow=slow)
+    buf = io.BytesIO()
+    tts.write_to_fp(buf)
+    return buf.getvalue()
+
+
+@app.post("/api/tts")
+async def text_to_speech(
+    req: TTSRequest,
+    request: Request,
+    user: Optional[dict] = Depends(get_current_user),
+):
+    """Convert text to speech audio (MP3).
+
+    Supports two backends:
+    - **edge-tts** (default): Microsoft Edge neural voices — high quality, many voices
+    - **gtts**: Google Translate TTS — simpler, fewer options
+
+    Returns audio/mpeg stream directly playable in browsers.
+    """
+    global _tts_active
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > TTS_MAX_TEXT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"text exceeds max length ({TTS_MAX_TEXT_LENGTH} chars)",
+        )
+    if _tts_active >= TTS_MAX_CONCURRENT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"TTS busy: {_tts_active} requests in flight (limit {TTS_MAX_CONCURRENT}). Retry shortly.",
+        )
+
+    backend = (req.backend or TTS_DEFAULT_BACKEND).lower().strip()
+    if backend not in ("edge-tts", "gtts"):
+        raise HTTPException(status_code=400, detail=f"invalid backend '{backend}', must be 'edge-tts' or 'gtts'")
+
+    _tts_active += 1
+    t0 = time.monotonic()
+    try:
+        if backend == "edge-tts":
+            voice = req.voice or _edge_tts_voice_for_lang(req.language)
+            try:
+                audio_bytes = await asyncio.wait_for(
+                    _synthesize_edge_tts(text, voice),
+                    timeout=TTS_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail=f"TTS timed out after {TTS_TIMEOUT:.0f}s")
+        else:
+            # gTTS is blocking — run in executor
+            lang = req.language.split("-")[0][:2] if req.language else "en"
+            loop = asyncio.get_event_loop()
+            try:
+                audio_bytes = await asyncio.wait_for(
+                    loop.run_in_executor(None, _synthesize_gtts, text, lang, req.slow),
+                    timeout=TTS_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail=f"TTS timed out after {TTS_TIMEOUT:.0f}s")
+
+        elapsed = time.monotonic() - t0
+        if not audio_bytes:
+            raise HTTPException(status_code=500, detail="TTS produced no audio")
+
+        log.info("TTS (%s) %d chars → %d bytes MP3 in %.2fs (lang=%s, user=%s)",
+                 backend, len(text), len(audio_bytes), elapsed,
+                 req.language, (user or {}).get("email", "anonymous"))
+        _log_activity("tts", user=user, language=req.language,
+                      text_length=len(text), file_size_bytes=len(audio_bytes),
+                      processing_time_s=round(elapsed, 3),
+                      client_ip=request.client.host if request.client else None)
+
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Length": str(len(audio_bytes)),
+                "X-TTS-Backend": backend,
+                "X-TTS-Processing-Time": f"{elapsed:.3f}",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("TTS failed: %s: %s\n%s", type(exc).__name__, exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"TTS failed: {type(exc).__name__}: {exc}")
+    finally:
+        _tts_active -= 1
+
+
+@app.get("/api/tts/voices")
+async def list_tts_voices():
+    """List available edge-tts voices (requires internet)."""
+    try:
+        import edge_tts
+        voices = await edge_tts.list_voices()
+        return {"voices": voices, "count": len(voices)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list voices: {exc}")
 
 
 if FRONTEND_DIR.exists():
