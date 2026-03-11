@@ -1,12 +1,48 @@
 /**
  * WhisperClient — ES module SDK for Whisper transcription.
  *
- * Usage:
- *   import { WhisperClient } from 'http://localhost:8000/whisper-client.js';
- *   const client = new WhisperClient({ server: 'http://localhost:8000' });
- *   await client.startRecording();
- *   const result = await client.stopRecording();
- *   console.log(result.text);
+ * Three modes of operation:
+ *
+ * 1. **Batch recording** — record with VAD, upload chunks, transcribe at end:
+ *    ```js
+ *    const client = new WhisperClient({ server: 'http://localhost:8000' });
+ *    await client.startRecording();
+ *    const result = await client.stopRecording();
+ *    console.log(result.text, result.segments);
+ *    ```
+ *
+ * 2. **Live streaming** — real-time utterance-by-utterance transcription:
+ *    ```js
+ *    const client = new WhisperClient({ server: 'http://localhost:8000' });
+ *    client.onTranscript = (r) => console.log(`[${r.sequence}] ${r.text}`);
+ *    await client.startStreaming();
+ *    // ... each utterance fires onTranscript as the user speaks ...
+ *    const { text, utterances } = await client.stopStreaming();
+ *    ```
+ *
+ * 3. **Live streaming with speaker detection** — real-time transcription + speaker labels:
+ *    ```js
+ *    const client = new WhisperClient({
+ *      server: 'http://localhost:8000',
+ *      diarize: true,         // enable speaker detection
+ *      maxSpeakers: 4,        // expected max speakers
+ *    });
+ *    client.onTranscript = (r) => {
+ *      for (const seg of r.segments || []) {
+ *        console.log(`${seg.speaker}: ${seg.text}`);
+ *      }
+ *    };
+ *    client.onSpeakerChange = (info) => {
+ *      console.log(`Speaker changed: ${info.previous} → ${info.current}`);
+ *    };
+ *    await client.startStreaming();
+ *    ```
+ *
+ * 4. **Single-shot transcription** — transcribe an existing audio file:
+ *    ```js
+ *    const result = await client.transcribe(audioBlob);
+ *    console.log(result.text);
+ *    ```
  */
 
 // -- VAD defaults --
@@ -87,9 +123,15 @@ export class WhisperClient {
     this.onStatusChange = null;
     /**
      * Streaming mode only. Called for each transcribed utterance.
-     * @type {((result: {text: string, sequence: number, processing_time_s: number}) => void) | null}
+     * @type {((result: {text: string, sequence: number, processing_time_s: number, segments?: Array}) => void) | null}
      */
     this.onTranscript = null;
+    /**
+     * Called when the detected speaker changes between utterances.
+     * Only fires when diarize is enabled.
+     * @type {((info: {previous: string|null, current: string, sequence: number}) => void) | null}
+     */
+    this.onSpeakerChange = null;
 
     // Internal state
     this._recording = false;
@@ -129,6 +171,10 @@ export class WhisperClient {
     this._streamAccumulated = '';      // full transcript returned by stopStreaming
     this._streamTimer = null;
     this._streamSampleRate = 16000;
+
+    // Speaker tracking (streaming + diarize mode)
+    this._currentSpeaker = null;       // last detected speaker label
+    this._speakerHistory = [];         // [{speaker, sequence, text}]
   }
 
   /** Whether the client is currently recording (batch mode). */
@@ -139,6 +185,16 @@ export class WhisperClient {
   /** Whether the client is currently streaming (live utterance mode). */
   get streaming() {
     return this._streaming;
+  }
+
+  /** The last detected speaker label (null if diarization not active). */
+  get currentSpeaker() {
+    return this._currentSpeaker;
+  }
+
+  /** History of speaker changes: [{speaker, sequence, text}]. */
+  get speakerHistory() {
+    return this._speakerHistory;
   }
 
   // -- Auth header --
@@ -369,6 +425,8 @@ export class WhisperClient {
     this._streamAccumulated = '';
     this._noiseFloor = 0.004;
     this._vadWarmupUntil = performance.now() + DEFAULT_VAD_WARMUP_MS;
+    this._currentSpeaker = null;
+    this._speakerHistory = [];
 
     const maxUtteranceSamples = Math.ceil((maxUtteranceMs / 1000) * this._streamSampleRate);
 
@@ -481,6 +539,8 @@ export class WhisperClient {
     return {
       text: this._streamAccumulated.trim(),
       utterances: this._streamSequence,
+      speakers: this.diarize ? [...new Set(this._speakerHistory.map(s => s.speaker))] : [],
+      speakerHistory: this.diarize ? this._speakerHistory : [],
     };
   }
 
@@ -549,6 +609,11 @@ export class WhisperClient {
       sequence: seq,
       context: this._streamContext,
     });
+    if (this.diarize) {
+      params.set('diarize', 'true');
+      params.set('min_speakers', this.minSpeakers);
+      params.set('max_speakers', this.maxSpeakers);
+    }
 
     try {
       const resp = await fetch(`${this.server}/api/stream/utterance?${params}`, {
@@ -560,9 +625,21 @@ export class WhisperClient {
         const result = await resp.json();
         const trimmed = (result.text || '').trim();
         if (trimmed) {
-          // Keep last 500 chars as Whisper prompt context for the next utterance
           this._streamContext = (this._streamContext + ' ' + trimmed).trim().slice(-500);
           this._streamAccumulated = (this._streamAccumulated + ' ' + trimmed).trim();
+        }
+        // Track speaker changes when diarization is active
+        if (this.diarize && result.segments) {
+          for (const seg of result.segments) {
+            if (seg.speaker && seg.speaker !== this._currentSpeaker) {
+              const prev = this._currentSpeaker;
+              this._currentSpeaker = seg.speaker;
+              this._speakerHistory.push({ speaker: seg.speaker, sequence: seq, text: (seg.text || '').trim() });
+              if (this.onSpeakerChange) {
+                this.onSpeakerChange({ previous: prev, current: seg.speaker, sequence: seq });
+              }
+            }
+          }
         }
         if (this.onTranscript) this.onTranscript(result);
       } else {
@@ -572,7 +649,6 @@ export class WhisperClient {
         if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: detail });
       }
     } catch (err) {
-      // Network error — non-fatal, utterance is lost but streaming continues
       console.error(`[WhisperClient] stream utterance seq=${seq} network error:`, err);
       if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: err.message });
     }

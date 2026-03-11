@@ -95,8 +95,8 @@
       </div>
       <!-- Live streaming: individual utterances appear here as they arrive -->
       <div id="streamLines" class="hidden space-y-1"></div>
-      <!-- Batch mode (or final result): single text block -->
-      <div id="transcript" class="min-h-[160px] leading-relaxed text-lg font-medium text-slate-100 whitespace-pre-wrap"></div>
+      <!-- Batch mode (or final result): single text block / speaker segments -->
+      <div id="transcript" class="min-h-[160px] leading-relaxed text-lg font-medium text-slate-100 whitespace-pre-wrap space-y-1"></div>
     </div>
 
     <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 space-y-2">
@@ -195,6 +195,7 @@ function speakerColor(label) {
     // Show speaker diarization toggle only when backend supports it
     if (data.features?.diarization) {
       diarizeLabel.classList.remove('hidden');
+      updateModeUI();
     }
     if (data.auth_required && !urlToken) {
       authBanner.classList.remove('hidden');
@@ -221,11 +222,26 @@ function speakerColor(label) {
 })();
 
 // ---- Mode toggle ----
-streamToggle.addEventListener('change', () => {
-  modeDesc.textContent = streamToggle.checked
-    ? 'Live streaming — transcript appears sentence by sentence'
-    : 'VAD-filtered recording with batch transcription';
-});
+function updateModeUI() {
+  const streaming = streamToggle.checked;
+  const speakers = diarizeToggle.checked;
+  if (streaming && speakers) {
+    modeDesc.textContent = 'Live streaming with speaker detection — adds ~2s latency per utterance';
+  } else if (streaming) {
+    modeDesc.textContent = 'Live streaming — transcript appears sentence by sentence';
+  } else {
+    modeDesc.textContent = 'VAD-filtered recording with batch transcription';
+  }
+  if (!diarizeLabel.classList.contains('hidden')) {
+    diarizeToggle.disabled = false;
+    diarizeLabel.style.opacity = '';
+    diarizeLabel.title = streaming
+      ? 'Identify speakers in real-time (adds ~2s latency per utterance)'
+      : 'Identify who spoke each segment (requires whisperX + HF token)';
+  }
+}
+streamToggle.addEventListener('change', updateModeUI);
+diarizeToggle.addEventListener('change', updateModeUI);
 
 // ---- State ----
 let isTranscribing = false;
@@ -272,24 +288,35 @@ function showStats(data) {
 // ---- Segment/speaker rendering ----
 function renderSegments(segments, container) {
   if (!segments || segments.length === 0) return;
-  // Group consecutive segments by speaker
-  let lastSpeaker = null;
+  container.style.whiteSpace = '';
+  let lastSpeaker = '__unset__';
+  let currentTextWrap = null;
   segments.forEach(seg => {
     const speaker = seg.speaker || null;
     const text = (seg.text || '').trim();
     if (!text) return;
-    const div = document.createElement('div');
-    div.className = 'flex gap-2 items-start mb-1';
-    if (speaker && speaker !== lastSpeaker) {
-      const color = speakerColor(speaker);
-      div.innerHTML = `<span class="text-xs font-mono mt-1 shrink-0 ${color}">${speaker}</span><span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>`;
+    if (speaker !== lastSpeaker) {
+      const block = document.createElement('div');
+      const isFirst = container.children.length === 0;
+      block.className = isFirst
+        ? 'flex gap-3 items-start'
+        : 'flex gap-3 items-start pt-2 border-t border-slate-800/60';
+      const badge = document.createElement('span');
+      if (speaker) {
+        const color = speakerColor(speaker);
+        badge.className = `text-xs font-bold font-mono mt-1.5 shrink-0 w-20 truncate ${color}`;
+        badge.textContent = speaker.replace('SPEAKER_', 'SPK ');
+      } else {
+        badge.className = 'w-0 shrink-0';
+      }
+      currentTextWrap = document.createElement('div');
+      currentTextWrap.className = 'flex-1 text-lg font-medium text-slate-100 leading-relaxed';
+      block.appendChild(badge);
+      block.appendChild(currentTextWrap);
+      container.appendChild(block);
       lastSpeaker = speaker;
-    } else if (speaker) {
-      div.innerHTML = `<span class="text-xs font-mono mt-1 shrink-0 opacity-0">${speaker}</span><span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>`;
-    } else {
-      div.innerHTML = `<span class="text-lg font-medium text-slate-100 leading-relaxed">${text}</span>`;
     }
-    container.appendChild(div);
+    currentTextWrap.textContent += (currentTextWrap.textContent ? ' ' : '') + text;
   });
 }
 
@@ -297,7 +324,9 @@ function renderSegments(segments, container) {
 function addStreamLine(text, seq, processingTime, segments) {
   const line = document.createElement('div');
   line.className = 'border-b border-slate-800/50 pb-2 mb-1';
-  if (segments && segments.length > 0) {
+  // Check if any segment has a speaker label (diarization active)
+  const hasSpeakers = segments && segments.some(s => s.speaker);
+  if (hasSpeakers) {
     const hdr = document.createElement('div');
     hdr.className = 'flex gap-2 items-center mb-1';
     hdr.innerHTML = `<span class="text-xs text-slate-500 font-mono">[${seq}]</span><span class="text-xs text-slate-600 font-mono ml-auto">${processingTime.toFixed(2)}s</span>`;
@@ -339,7 +368,8 @@ micBtn.addEventListener('click', async () => {
       loadingRow.classList.remove('hidden');
       try {
         const result = await client.stopStreaming();
-        statusText.textContent = `Done — ${result.utterances} utterance(s). Click mic to record again.`;
+        const speakerInfo = result.speakers.length > 0 ? `, ${result.speakers.length} speaker(s)` : '';
+        statusText.textContent = `Done — ${result.utterances} utterance(s)${speakerInfo}. Click mic to record again.`;
         statusDot.style.backgroundColor = '#34d399';
         // Show full accumulated text in main transcript block too
         if (result.text) {
@@ -370,8 +400,9 @@ micBtn.addEventListener('click', async () => {
       try {
         const result = await client.stopRecording();
         if (result.text) {
+          transcriptEl.textContent = '';
+          transcriptEl.style.whiteSpace = '';
           if (result.segments && result.segments.length > 0) {
-            transcriptEl.textContent = '';
             renderSegments(result.segments, transcriptEl);
           } else {
             transcriptEl.textContent = result.text;

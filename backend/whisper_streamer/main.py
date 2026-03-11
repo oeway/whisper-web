@@ -1003,13 +1003,16 @@ async def stream_utterance(
     context: str = Query(""),
     sequence: int = Query(0),
     diarize: bool = Query(False),
+    min_speakers: int = Query(1),
+    max_speakers: int = Query(10),
     user: Optional[dict] = Depends(get_current_user),
 ):
     """Streaming VAD endpoint — transcribe one detected utterance and return immediately.
 
     Thin wrapper around /api/transcribe with a ``sequence`` field for client-side ordering.
     When whisperX is active, word-level alignment is always performed (adds ~50ms on CPU).
-    Speaker diarization is skipped for streaming (too slow per-utterance).
+    Speaker diarization is optional — it adds ~1-3s latency per utterance but enables
+    real-time speaker labels in the response segments.
     """
     _validate_model_size(model_size)
     audio_bytes = await audio.read()
@@ -1022,9 +1025,10 @@ async def stream_utterance(
     prompt = context.strip()[-500:] if context else None
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-    # For streaming utterances: skip diarization (latency) but keep word alignment
     result = await _run_transcription(model_or_repo, audio_bytes, lang, prompt,
-                                      align=True, diarize=False)
+                                      align=True, diarize=diarize,
+                                      min_speakers=min_speakers,
+                                      max_speakers=max_speakers)
     text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
 

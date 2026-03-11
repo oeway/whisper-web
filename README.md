@@ -2,7 +2,7 @@
 
 Web-based voice transcription powered by OpenAI's Whisper. Record audio in your browser, get transcripts back in seconds.
 
-Runs on **Apple Silicon GPUs** (via MLX) and **Linux with CUDA** (via faster-whisper). Falls back to CPU anywhere else.
+Supports **live streaming transcription**, **speaker diarization** (who said what), and **batch recording**. Runs on **Apple Silicon GPUs** (via MLX), **Linux with CUDA** (via faster-whisper/whisperX), or CPU.
 
 ## Quick Start
 
@@ -69,6 +69,9 @@ Environment variables:
 | `WHISPER_MAX_CHUNK_BYTES` | `52428800` | Max total session size in bytes (50 MB) |
 | `WHISPER_REQUIRE_AUTH` | `false` | Require Hypha token for all API requests |
 | `HYPHA_TOKEN_URL` | `https://hypha.aicell.io/public/services/ws/parse_token` | Hypha token validation endpoint |
+| `WHISPER_BACKEND` | `auto` | Force backend (`auto`, `mlx`, `whisperx`, `faster-whisper`) |
+| `WHISPER_HF_TOKEN` | — | HuggingFace token for pyannote speaker diarization |
+| `WHISPERX_BATCH_SIZE` | `8` | Batch size for whisperX transcription |
 | `WHISPER_ACTIVITY_LOG` | `activity.jsonl` | Path to the JSON Lines activity log |
 
 Example:
@@ -111,7 +114,7 @@ Example entry:
 
 ### `POST /api/transcribe` (single-shot)
 
-Upload a complete audio file and get the transcript back in one request. Simplest way to use the API.
+Upload a complete audio file and get the transcript back in one request. Supports speaker diarization.
 
 **Query parameters:**
 
@@ -120,12 +123,21 @@ Upload a complete audio file and get the transcript back in one request. Simples
 | `model_size` | `small` | Whisper model to use |
 | `language` | `auto` | Language code (`en`, `zh`, `ja`, etc.) or `auto` |
 | `prompt` | `""` | System prompt passed to Whisper as `initial_prompt` |
+| `diarize` | `false` | Enable speaker diarization (whisperX backend + HF token required) |
+| `align_words` | `false` | Enable word-level timestamps (whisperX only) |
+| `min_speakers` | `1` | Minimum expected speakers (diarization hint) |
+| `max_speakers` | `10` | Maximum expected speakers (diarization hint) |
 
 **Body:** multipart form with an `audio` file field.
 
 ```bash
+# Basic transcription
 curl -X POST "http://localhost:8000/api/transcribe?model_size=small&language=en" \
   -F "audio=@recording.wav"
+
+# With speaker diarization
+curl -X POST "http://localhost:8000/api/transcribe?diarize=true&max_speakers=3" \
+  -F "audio=@meeting.wav"
 ```
 
 **Response:**
@@ -137,11 +149,55 @@ curl -X POST "http://localhost:8000/api/transcribe?model_size=small&language=en"
   "processing_time_s": 0.42,
   "model": "small",
   "language": "en",
-  "prompt": ""
+  "segments": [
+    {
+      "start": 0.0, "end": 2.5,
+      "text": "Hello world this is a test.",
+      "speaker": "SPEAKER_00"
+    }
+  ]
 }
 ```
 
-### `POST /api/session/{session_id}/chunk` (streaming upload)
+### `POST /api/stream/utterance` (live streaming)
+
+Transcribe a single utterance in real time. Designed for the client SDK's streaming mode where VAD detects speech boundaries and sends each utterance as it completes.
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `model_size` | `small` | Whisper model to use |
+| `language` | `auto` | Language code or `auto` |
+| `context` | `""` | Previous transcript text (used as Whisper prompt for continuity) |
+| `sequence` | `0` | Client-side utterance sequence number |
+| `diarize` | `false` | Enable speaker detection (adds ~1-3s latency per utterance) |
+| `min_speakers` | `1` | Min speakers hint |
+| `max_speakers` | `10` | Max speakers hint |
+
+**Body:** multipart form with an `audio` file field (WAV).
+
+**Response:**
+
+```json
+{
+  "text": "Hello how are you?",
+  "sequence": 1,
+  "file_size_bytes": 32000,
+  "processing_time_s": 0.32,
+  "model": "small",
+  "language": "en",
+  "segments": [
+    {
+      "start": 0.0, "end": 1.8,
+      "text": "Hello how are you?",
+      "speaker": "SPEAKER_00"
+    }
+  ]
+}
+```
+
+### `POST /api/session/{session_id}/chunk` (batch upload)
 
 Upload audio chunks incrementally during recording. Useful for long recordings with VAD filtering.
 
@@ -156,7 +212,7 @@ Upload audio chunks incrementally during recording. Useful for long recordings w
 }
 ```
 
-### `POST /api/session/{session_id}/transcribe`
+### `POST /api/session/{session_id}/transcribe` (batch transcribe)
 
 Concatenate all uploaded chunks for this session and transcribe as one audio. Consumes and removes the session.
 
@@ -164,54 +220,131 @@ Concatenate all uploaded chunks for this session and transcribe as one audio. Co
 
 **Response:** same as `/api/transcribe`, plus `"chunks": 3`.
 
-### `GET /health`
+### `GET /api/health`
 
-Returns server status and active backend info.
+Returns server status, backend info, and feature flags.
 
 ```json
 {
-  "status": "ok",
-  "backend": "mlx-whisper",
+  "status": "ready",
+  "backend": "whisperX (VAD+alignment+diarization)",
   "default_model": "small",
-  "device": "apple-silicon-gpu",
-  "compute_type": "mlx-float16",
-  "auth_required": false
+  "loaded_models": ["small"],
+  "device": "auto",
+  "compute_type": "float32",
+  "auth_required": false,
+  "features": {
+    "diarization": true,
+    "word_alignment": true,
+    "streaming": true
+  }
 }
 ```
 
 ## JavaScript SDK
 
-A browser ES module is served at `/whisper-client.js` for integrating transcription into your own web apps. TypeScript declarations are at `/whisper-client.d.ts`.
+A browser ES module is served at `/whisper-client.js` for integrating transcription into your own web apps. No build step required.
 
 ```js
 import { WhisperClient } from 'http://localhost:8000/whisper-client.js';
 
 const client = new WhisperClient({
   server: 'http://localhost:8000',  // default: same origin
-  token: 'your-hypha-token',        // optional
+  token: 'your-hypha-token',        // optional auth token
   model: 'small',                    // tiny | base | small | medium | large-v3
   language: 'auto',                  // language code or 'auto'
   prompt: '',                        // optional initial prompt
+  diarize: false,                    // enable speaker detection
+  maxSpeakers: 10,                   // max expected speakers
+});
+```
+
+### Mode 1: Live Streaming (real-time transcription)
+
+Audio is transcribed utterance-by-utterance as the user speaks. Each completed utterance fires `onTranscript`.
+
+```js
+client.onTranscript = (result) => {
+  console.log(`[${result.sequence}] ${result.text}`);
+};
+
+await client.startStreaming({
+  utteranceGapMs: 1500,   // silence gap that ends an utterance (default 1500ms)
+  maxUtteranceMs: 25000,  // force-flush after 25s of continuous speech
 });
 
-// Check server health
-const health = await client.getHealth();
+// ... user speaks, onTranscript fires for each utterance ...
 
-// Option A: Record from microphone with VAD
+const summary = await client.stopStreaming();
+console.log(summary.text);       // full accumulated transcript
+console.log(summary.utterances); // total utterance count
+```
+
+### Mode 2: Live Streaming with Speaker Detection
+
+Enable `diarize: true` to get speaker labels on each utterance in real time. Adds ~1-3s latency per utterance.
+
+```js
+const client = new WhisperClient({
+  server: 'http://localhost:8000',
+  diarize: true,
+  maxSpeakers: 4,
+});
+
+client.onTranscript = (result) => {
+  for (const seg of result.segments || []) {
+    console.log(`${seg.speaker}: ${seg.text}`);
+  }
+};
+
+client.onSpeakerChange = (info) => {
+  console.log(`Speaker changed: ${info.previous} → ${info.current}`);
+};
+
+await client.startStreaming();
+// ... conversation happens ...
+const summary = await client.stopStreaming();
+console.log(summary.speakers);       // ["SPEAKER_00", "SPEAKER_01"]
+console.log(summary.speakerHistory); // [{speaker, sequence, text}, ...]
+```
+
+### Mode 3: Batch Recording with VAD
+
+Record with VAD-filtered chunk uploads, then transcribe everything at once. Best for long recordings where you want the full context for maximum accuracy and diarization quality.
+
+```js
 client.onChunkUploaded = (info) => console.log(info.chunks, info.totalBytes);
 client.onStatusChange = (status) => console.log(status);
 
 await client.startRecording();
+// ... user speaks ...
 const result = await client.stopRecording();
 console.log(result.text);
-// result: { text, chunks, file_size_bytes, processing_time_s, model, language, prompt }
-
-// Option B: Transcribe a file directly
-const result2 = await client.transcribe(audioBlob);
-
-// Cleanup
-client.destroy();
+console.log(result.segments); // with speaker labels if diarize=true
 ```
+
+### Mode 4: Single-shot Transcription
+
+Transcribe an existing audio file (Blob, File, or fetch response).
+
+```js
+const result = await client.transcribe(audioBlob, 'meeting.wav');
+console.log(result.text, result.segments);
+```
+
+### Properties & Callbacks
+
+| Property | Type | Description |
+|---|---|---|
+| `client.recording` | `boolean` | Whether batch recording is active |
+| `client.streaming` | `boolean` | Whether live streaming is active |
+| `client.currentSpeaker` | `string\|null` | Last detected speaker label |
+| `client.speakerHistory` | `Array` | History of speaker changes |
+| `client.onTranscript` | `Function` | Called per utterance (streaming mode) |
+| `client.onSpeakerChange` | `Function` | Called when speaker changes (streaming + diarize) |
+| `client.onChunkUploaded` | `Function` | Called per chunk upload (batch mode) |
+| `client.onStatusChange` | `Function` | Called on status transitions |
+| `client.destroy()` | method | Release all resources |
 
 The `GET /sdk` endpoint redirects to `/whisper-client.js` for discoverability.
 
