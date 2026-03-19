@@ -65,6 +65,9 @@ Environment variables:
 | `WHISPER_DEVICE` | `auto` | Device for faster-whisper (`auto`, `cpu`, `cuda`) |
 | `WHISPER_COMPUTE_TYPE` | `float32` | Compute type for faster-whisper (`float32`, `float16`, `int8`) |
 | `WHISPER_MAX_WORKERS` | `2` | Max parallel transcription threads |
+| `WHISPER_MAX_QUEUE` | `workers×8` | Max in-flight requests before returning 429 |
+| `WHISPER_INFERENCE_TIMEOUT` | `120` | Per-request inference timeout in seconds |
+| `WHISPER_MAX_SESSIONS` | `200` | Max concurrent batch sessions |
 | `WHISPER_SESSION_TTL` | `600` | Seconds before idle sessions are evicted |
 | `WHISPER_MAX_CHUNK_BYTES` | `52428800` | Max total session size in bytes (50 MB) |
 | `WHISPER_REQUIRE_AUTH` | `false` | Require Hypha token for all API requests |
@@ -194,6 +197,20 @@ Concatenate all uploaded chunks for this session and transcribe as one audio. Co
 **Query parameters:** same as `/api/transcribe`.
 
 **Response:** same as `/api/transcribe`, plus `"chunks": 3`.
+
+### `DELETE /api/session/{session_id}`
+
+Explicitly discard a session and free its memory.
+
+**Response:**
+
+```json
+{
+  "deleted": "session-abc",
+  "chunks": 5,
+  "bytes_freed": 240000
+}
+```
 
 ### `POST /api/tts` (text-to-speech)
 
@@ -380,7 +397,8 @@ Key design decisions:
 - **Session TTL:** Idle sessions are automatically evicted after `WHISPER_SESSION_TTL` seconds (default 10 minutes) to prevent memory leaks.
 - **Lazy model loading:** Models are downloaded and loaded on the first request that uses them, then cached in memory.
 - **Back-pressure:** Requests beyond `MAX_QUEUE` are rejected with HTTP 429 to prevent unbounded queuing.
-- **Inference timeout:** Individual requests time out after `WHISPER_INFERENCE_TIMEOUT` seconds (default 120s).
+- **Inference timeout:** Individual requests time out after `WHISPER_INFERENCE_TIMEOUT` seconds (default 120s, 300s on K8s).
+- **Memory-efficient concatenation:** Batch session audio is concatenated to a temp file on disk rather than in memory, avoiding 3× peak memory usage for long recordings.
 
 ### System Prompt
 
@@ -399,6 +417,45 @@ The optional system prompt is passed to Whisper as `initial_prompt`. This helps 
 | `small` | 244M | Balanced | General purpose (default) |
 | `medium` | 769M | Slower | Higher accuracy |
 | `large-v3` | 1.5B | Slowest | Maximum accuracy |
+
+## Kubernetes Deployment
+
+A Helm chart is included in `helm/whisper-web/`.
+
+```bash
+# Deploy to a namespace
+helm upgrade --install whisper-web helm/whisper-web/ -n my-namespace
+
+# Override values
+helm upgrade --install whisper-web helm/whisper-web/ -n my-namespace \
+  --set env.WHISPER_MODEL_SIZE=medium \
+  --set env.WHISPER_REQUIRE_AUTH=true \
+  --set resources.requests.cpu=1 \
+  --set resources.requests.memory=2Gi
+```
+
+Key features:
+- **HPA auto-scaling** (1–5 pods by default, scales on CPU)
+- **Sticky sessions** via nginx ingress cookie for batch session affinity
+- **Health probes**: startup (model loading), liveness (executor check), readiness
+- **Pre-baked model**: Docker image includes the default model to avoid download on startup
+- **Non-root security context** with dropped capabilities
+
+The Docker image is built automatically by GitHub Actions on push to `main` and published to `ghcr.io/oeway/whisper-web:main`.
+
+## Integration Tests
+
+Run tests against any server:
+
+```bash
+# Local (no auth)
+python tests/test_api_integration.py
+
+# Remote (with auth)
+python tests/test_api_integration.py --server https://whisper.hypha.aicell.io --token $HYPHA_TOKEN
+```
+
+Tests cover all 3 API modes using real synthesized speech (macOS `say` command).
 
 ## License
 

@@ -140,8 +140,12 @@ class TestResults:
         return self.failed == 0
 
 
-def run_tests(server: str):
-    client = httpx.Client(base_url=server, timeout=120.0)
+def run_tests(server: str, token: str = ""):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    client = httpx.Client(base_url=server, timeout=120.0, headers=headers,
+                          follow_redirects=True, cookies=httpx.Cookies())
     results = TestResults()
 
     # -----------------------------------------------------------------------
@@ -391,7 +395,8 @@ def run_tests(server: str):
     short_wav = synthesize_speech_wav("Testing concurrency.")
 
     def do_transcribe(idx):
-        c = httpx.Client(base_url=server, timeout=120.0)
+        c = httpx.Client(base_url=server, timeout=120.0, headers=headers,
+                         follow_redirects=True, cookies=httpx.Cookies())
         t0 = time.monotonic()
         r = c.post(
             "/api/transcribe",
@@ -602,13 +607,17 @@ def main():
     parser = argparse.ArgumentParser(description="Whisper Web API Integration Tests")
     parser.add_argument("--server", default=DEFAULT_SERVER,
                         help=f"Server URL (default: {DEFAULT_SERVER})")
+    parser.add_argument("--token", default=os.getenv("HYPHA_TOKEN", ""),
+                        help="Hypha auth token (or set HYPHA_TOKEN env var)")
     args = parser.parse_args()
 
     print(f"Whisper Web API Integration Tests")
     print(f"Server: {args.server}")
+    if args.token:
+        print(f"Auth: token provided ({len(args.token)} chars)")
     print(f"{'='*60}")
 
-    results = run_tests(args.server)
+    results = run_tests(args.server, token=args.token)
     ok = results.summary()
     sys.exit(0 if ok else 1)
 
