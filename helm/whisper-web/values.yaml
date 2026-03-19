@@ -123,17 +123,17 @@ resources:
 # Only effective when the /api/transcribe (stateless) endpoint is used;
 # batch-mode sessions require sticky sessions (sessionAffinity: ClientIP).
 hpa:
-  enabled: false
+  enabled: true
   minReplicas: 1
   maxReplicas: 5
   targetCPUUtilizationPercentage: 70
 
 # ── Session affinity ──────────────────────────────────────────────────────────
 # Required when using the stateful session API (/api/session/…) with >1 replica.
-# Not needed when using only /api/transcribe or /api/stream/utterance.
+# Also helpful for live streaming so utterances from the same user hit the same pod.
 sessionAffinity:
-  enabled: false
-  # timeoutSeconds: 10800
+  enabled: true
+  timeoutSeconds: 10800
 
 nodeSelector: {}
 tolerations: []
