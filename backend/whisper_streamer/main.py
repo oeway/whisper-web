@@ -266,55 +266,68 @@ def _log_activity(
 # ---------------------------------------------------------------------------
 # WAV concatenation helper
 # ---------------------------------------------------------------------------
-def _concat_wav_chunks(chunks: List[bytes]) -> bytes:
-    """Concatenate multiple WAV files into a single WAV.
+def _concat_wav_chunks_to_file(chunks: List[bytes]) -> str:
+    """Concatenate multiple WAV files into a single WAV temp file.
 
-    Reads the header from the first chunk to determine sample rate / format,
-    then strips headers from subsequent chunks and writes one combined file.
+    Returns the path to the temp file.  Caller is responsible for deleting it.
+    Writing to disk avoids the 3× memory peak that in-memory concat causes
+    (original chunks + PCM buffer + final WAV copy).
     """
     if not chunks:
-        return b""
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        return tmp.name
     if len(chunks) == 1:
-        return chunks[0]
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.write(chunks[0])
+        tmp.close()
+        return tmp.name
 
     # Parse header from the first chunk (standard 44-byte PCM WAV header)
     first = chunks[0]
     if len(first) < 44:
-        return first
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.write(first)
+        tmp.close()
+        return tmp.name
     sample_rate = struct.unpack_from("<I", first, 24)[0]
     num_channels = struct.unpack_from("<H", first, 22)[0]
     bits_per_sample = struct.unpack_from("<H", first, 34)[0]
     block_align = num_channels * (bits_per_sample // 8)
     byte_rate = sample_rate * block_align
 
-    # Collect PCM data from all chunks (skip 44-byte headers)
-    # Use a BytesIO buffer to avoid holding duplicate copies in memory
-    pcm_buf = io.BytesIO()
+    # Compute total PCM data size without copying
+    data_size = 0
     for wav_bytes in chunks:
-        if len(wav_bytes) > 44:
-            pcm_buf.write(wav_bytes[44:])
-        else:
-            pcm_buf.write(wav_bytes)
-    data_size = pcm_buf.tell()
+        data_size += max(0, len(wav_bytes) - 44) if len(wav_bytes) > 44 else len(wav_bytes)
 
-    # Build new WAV header
-    buf = io.BytesIO()
-    buf.write(b"RIFF")
-    buf.write(struct.pack("<I", 36 + data_size))
-    buf.write(b"WAVE")
-    buf.write(b"fmt ")
-    buf.write(struct.pack("<I", 16))                # PCM chunk size
-    buf.write(struct.pack("<H", 1))                 # PCM format
-    buf.write(struct.pack("<H", num_channels))
-    buf.write(struct.pack("<I", sample_rate))
-    buf.write(struct.pack("<I", byte_rate))
-    buf.write(struct.pack("<H", block_align))
-    buf.write(struct.pack("<H", bits_per_sample))
-    buf.write(b"data")
-    buf.write(struct.pack("<I", data_size))
-    buf.write(pcm_buf.getvalue())
-    pcm_buf.close()
-    return buf.getvalue()
+    # Write WAV header + PCM data directly to temp file (no in-memory copy)
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    try:
+        tmp.write(b"RIFF")
+        tmp.write(struct.pack("<I", 36 + data_size))
+        tmp.write(b"WAVE")
+        tmp.write(b"fmt ")
+        tmp.write(struct.pack("<I", 16))                # PCM chunk size
+        tmp.write(struct.pack("<H", 1))                 # PCM format
+        tmp.write(struct.pack("<H", num_channels))
+        tmp.write(struct.pack("<I", sample_rate))
+        tmp.write(struct.pack("<I", byte_rate))
+        tmp.write(struct.pack("<H", block_align))
+        tmp.write(struct.pack("<H", bits_per_sample))
+        tmp.write(b"data")
+        tmp.write(struct.pack("<I", data_size))
+        for wav_bytes in chunks:
+            if len(wav_bytes) > 44:
+                tmp.write(wav_bytes[44:])
+            else:
+                tmp.write(wav_bytes)
+        tmp.close()
+    except Exception:
+        tmp.close()
+        os.unlink(tmp.name)
+        raise
+    return tmp.name
 
 
 # ---------------------------------------------------------------------------
@@ -533,28 +546,35 @@ def transcribe_bytes(model_or_repo, audio_bytes: bytes, suffix: str,
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
-        t0 = time.monotonic()
-        try:
-            if USE_MLX:
-                result = _transcribe_mlx(tmp.name, model_or_repo, lang, prompt)
-            else:
-                result = _transcribe_ctranslate(tmp.name, model_or_repo, lang, prompt)
-            log.info("transcribe_bytes done: %.2fs text_len=%d thread=%s",
-                     time.monotonic() - t0, len(result), thread_name)
-            return result
-        except FileNotFoundError as exc:
-            if "ffmpeg" in str(exc):
-                log.error("transcribe_bytes ffmpeg not found: %s\n%s", exc, traceback.format_exc())
-                raise RuntimeError(
-                    "ffmpeg not found. Install it (e.g. 'brew install ffmpeg') "
-                    "or add imageio-ffmpeg to the dependencies."
-                ) from exc
-            log.error("transcribe_bytes FileNotFoundError: %s\n%s", exc, traceback.format_exc())
-            raise
-        except Exception as exc:
-            log.error("transcribe_bytes FAILED after %.2fs: %s: %s\n%s",
-                      time.monotonic() - t0, type(exc).__name__, exc, traceback.format_exc())
-            raise
+        return _transcribe_from_path(tmp.name, model_or_repo, lang, prompt)
+
+
+def _transcribe_from_path(path: str, model_or_repo, language: Optional[str],
+                          prompt: Optional[str]) -> str:
+    """Run Whisper inference on an audio file already on disk."""
+    thread_name = threading.current_thread().name
+    t0 = time.monotonic()
+    try:
+        if USE_MLX:
+            result = _transcribe_mlx(path, model_or_repo, language, prompt)
+        else:
+            result = _transcribe_ctranslate(path, model_or_repo, language, prompt)
+        log.info("transcribe done: %.2fs text_len=%d thread=%s",
+                 time.monotonic() - t0, len(result), thread_name)
+        return result
+    except FileNotFoundError as exc:
+        if "ffmpeg" in str(exc):
+            log.error("transcribe ffmpeg not found: %s\n%s", exc, traceback.format_exc())
+            raise RuntimeError(
+                "ffmpeg not found. Install it (e.g. 'brew install ffmpeg') "
+                "or add imageio-ffmpeg to the dependencies."
+            ) from exc
+        log.error("transcribe FileNotFoundError: %s\n%s", exc, traceback.format_exc())
+        raise
+    except Exception as exc:
+        log.error("transcribe FAILED after %.2fs: %s: %s\n%s",
+                  time.monotonic() - t0, type(exc).__name__, exc, traceback.format_exc())
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -562,12 +582,16 @@ def transcribe_bytes(model_or_repo, audio_bytes: bytes, suffix: str,
 # ---------------------------------------------------------------------------
 async def _run_transcription(
     model_or_repo,
-    audio_bytes: bytes,
+    audio_bytes: Optional[bytes],
     language: Optional[str],
     prompt: Optional[str],
     align: bool = True,
+    audio_path: Optional[str] = None,
 ) -> dict:
     """Submit a transcription job to the thread pool with back-pressure and timeout.
+
+    Provide either ``audio_bytes`` (in-memory) or ``audio_path`` (file on disk).
+    Using ``audio_path`` avoids an extra memory copy for large session concatenations.
 
     Returns a dict: {text, segments, language} — segments is None for non-whisperX backends.
 
@@ -590,6 +614,10 @@ async def _run_transcription(
         try:
             if USE_WHISPERX:
                 device = DEFAULT_DEVICE if DEFAULT_DEVICE != "auto" else "cpu"
+                # whisperX needs bytes (reads via soundfile)
+                if audio_bytes is None and audio_path:
+                    with open(audio_path, "rb") as f:
+                        audio_bytes = f.read()
                 result = await asyncio.wait_for(
                     loop.run_in_executor(
                         _transcription_executor,
@@ -599,6 +627,17 @@ async def _run_transcription(
                     ),
                     timeout=INFERENCE_TIMEOUT,
                 )
+            elif audio_path:
+                # Faster-whisper / MLX: transcribe directly from file path
+                text = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _transcription_executor,
+                        _transcribe_from_path,
+                        audio_path, model_or_repo, language, prompt,
+                    ),
+                    timeout=INFERENCE_TIMEOUT,
+                )
+                result = {"text": text, "segments": None, "language": language or "auto"}
             else:
                 text = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -919,23 +958,36 @@ async def transcribe_session(
     sticky sessions (sessionAffinity: ClientIP) or prefer /api/transcribe.
     """
     _validate_model_size(model_size)
-    entry = _sessions.get(session_id)
+    # Pop session immediately to free memory before the expensive transcription.
+    # This avoids holding chunks + combined WAV + model inference simultaneously.
+    entry = _sessions.pop(session_id, None)
     if entry is None:
         raise HTTPException(status_code=404, detail="no audio for this session")
     _, chunks = entry
 
-    combined = _concat_wav_chunks(chunks)
-    file_size = len(combined)
+    # Concatenate to a temp file on disk — avoids 3× memory peak from in-memory concat.
+    wav_path = _concat_wav_chunks_to_file(chunks)
+    file_size = os.path.getsize(wav_path)
     num_chunks = len(chunks)
+    # Explicitly free chunk references so GC can reclaim memory now
+    del chunks, entry
     lang = language if language and language != "auto" else None
 
     model_or_repo = await model_pool.get(model_size)
     t0 = time.monotonic()
-    result = await _run_transcription(model_or_repo, combined, lang, prompt or None)
+    try:
+        result = await _run_transcription(
+            model_or_repo, None, lang, prompt or None,
+            audio_path=wav_path,
+        )
+    finally:
+        # Always clean up the temp file
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
     text = _filter_hallucination(result["text"])
     elapsed = time.monotonic() - t0
-    # Only remove session after successful transcription
-    _sessions.pop(session_id, None)
 
     log.info("Transcribed %d chunks (%d bytes) in %.2fs (model=%s, lang=%s, user=%s)",
              num_chunks, file_size, elapsed, model_size, language,

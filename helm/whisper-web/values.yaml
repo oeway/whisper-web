@@ -15,9 +15,9 @@ ingress:
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/proxy-body-size: 100m
-    # Increase timeouts for long transcription requests
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    # Increase timeouts for long transcription requests (must exceed WHISPER_INFERENCE_TIMEOUT)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "360"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "360"
     nginx.ingress.kubernetes.io/enable-cors: "true"
     nginx.ingress.kubernetes.io/cors-allow-origin: "*"
     nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
@@ -41,8 +41,9 @@ env:
   WHISPER_MAX_WORKERS: "2"
   # Maximum in-flight requests before 429 is returned (queue = workers × 8 by default).
   # WHISPER_MAX_QUEUE: "16"
-  # Per-request inference timeout in seconds (default 120).
-  # WHISPER_INFERENCE_TIMEOUT: "120"
+  # Per-request inference timeout in seconds.
+  # Raised to 300s to support long recordings (~10+ min) on CPU.
+  WHISPER_INFERENCE_TIMEOUT: "300"
   # Number of uvicorn worker processes per pod.
   # Increase only if CPU-bound and each worker's RAM cost is acceptable.
   UVICORN_WORKERS: "1"
