@@ -228,15 +228,47 @@ const client = new WhisperClient({
   prompt: promptInput.value,
 });
 
+// ---- Shared error banner helper ----
+function showBanner(html) {
+  authBanner.innerHTML = html;
+  authBanner.classList.remove('hidden');
+}
+function blockMic(reason) {
+  micBtn.disabled = true;
+  micBtn.style.opacity = 0.4;
+  statusText.textContent = reason;
+}
+
+// Surface non-retryable background upload failures (e.g. auth) that would
+// otherwise be silent during recording/streaming.
+client.onError = (err) => {
+  const msg = err.message || 'Upload failed';
+  if (err.status === 401 || err.status === 403) {
+    showBanner('<strong>Authentication failed.</strong> Your token is missing or expired — reload with a valid <code class="bg-red-950 px-1 rounded">?token=YOUR_TOKEN</code>.');
+  }
+  statusText.textContent = `Error: ${msg}`;
+  statusDot.style.backgroundColor = '#f87171';
+  // Stop any in-progress capture so the user isn't left "recording" into a void.
+  if (err.fatal) {
+    try { client.destroy(); } catch (_) {}
+    clearInterval(timerInterval);
+    setRecordingUI(false);
+    micBtn.disabled = false;
+    micBtn.style.opacity = 1;
+    micBtn.style.background = '';
+    loadingRow.classList.add('hidden');
+    streamToggle.disabled = false;
+    isTranscribing = false;
+  }
+};
+
 // ---- Auth check on load ----
 (async () => {
   try {
     const data = await client.getHealth();
     if (data.auth_required && !urlToken) {
       authBanner.classList.remove('hidden');
-      micBtn.disabled = true;
-      micBtn.style.opacity = 0.4;
-      statusText.textContent = 'Authentication required to use this service.';
+      blockMic('Authentication required to use this service.');
       return;
     }
     if (data.auth_required && urlToken) {
@@ -245,15 +277,17 @@ const client = new WhisperClient({
         headers: urlToken ? { 'Authorization': `Bearer ${urlToken}` } : {},
         body: (() => { const fd = new FormData(); fd.append('chunk', new Blob([new Uint8Array(0)]), 'empty.wav'); return fd; })(),
       });
-      if (testResp.status === 401) {
-        authBanner.innerHTML = '<strong>Invalid or expired token.</strong> Please provide a valid Hypha token in the URL.';
-        authBanner.classList.remove('hidden');
-        micBtn.disabled = true;
-        micBtn.style.opacity = 0.4;
-        statusText.textContent = 'Authentication failed.';
+      if (testResp.status === 401 || testResp.status === 403) {
+        showBanner('<strong>Invalid or expired token.</strong> Please provide a valid Hypha token in the URL.');
+        blockMic('Authentication failed.');
       }
     }
-  } catch (_) {}
+  } catch (e) {
+    // Don't swallow connectivity failures — a blank, mic-enabled UI that does
+    // nothing is exactly the "no response, no error" symptom we're fixing.
+    showBanner('<strong>Cannot reach the transcription server.</strong> It may be down or unreachable. Please try again shortly.');
+    blockMic('Server unreachable.');
+  }
 })();
 
 // ---- Mode toggle ----
@@ -360,7 +394,9 @@ micBtn.addEventListener('click', async () => {
       }
     } else {
       // Batch mode
-      if (client._chunksSent === 0 && client._pcmLength === 0) {
+      // Skip the "no speech" shortcut if uploads actually failed (e.g. auth) —
+      // let stopRecording() run so the real error is thrown and shown.
+      if (client._chunksSent === 0 && client._pcmLength === 0 && !client._lastChunkError) {
         statusText.textContent = 'No speech detected. Try again.';
         micBtn.disabled = false;
         micBtn.style.opacity = 1;

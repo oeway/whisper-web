@@ -104,6 +104,13 @@ export class WhisperClient {
      * @type {((result: {text: string, sequence: number, processing_time_s: number}) => void) | null}
      */
     this.onTranscript = null;
+    /**
+     * Called when a non-retryable error occurs during background uploads
+     * (e.g. a 401/403 auth failure while streaming chunks in batch mode).
+     * Lets the UI surface failures that would otherwise be silent.
+     * @type {((err: {status: number|null, message: string, fatal: boolean}) => void) | null}
+     */
+    this.onError = null;
 
     // Internal state
     this._recording = false;
@@ -129,6 +136,10 @@ export class WhisperClient {
     // Chunk tracking (batch mode)
     this._chunksSent = 0;
     this._totalBytesSent = 0;
+    // Last non-retryable error from a background chunk upload (batch mode).
+    // Surfaced by stopRecording() so auth/network failures aren't swallowed.
+    /** @type {{status: number|null, message: string} | null} */
+    this._lastChunkError = null;
 
     // Streaming mode state
     this._streamPreRollBuffers = [];
@@ -166,6 +177,26 @@ export class WhisperClient {
     if (this.onStatusChange) this.onStatusChange(status);
   }
 
+  // Extract a human-readable message from a failed response, decoding
+  // FastAPI's `{detail: ...}` shapes (string, validation array, or object).
+  async _errorDetail(resp) {
+    let detail = `HTTP ${resp.status}`;
+    if (resp.status === 401) detail = 'Authentication required or token expired';
+    else if (resp.status === 403) detail = 'Not authorized (invalid token)';
+    try {
+      const j = await resp.json();
+      const d = j.detail;
+      if (typeof d === 'string') detail = d;
+      else if (Array.isArray(d)) detail = d.map((e) => e.msg || JSON.stringify(e)).join('; ');
+      else if (d) detail = JSON.stringify(d);
+    } catch (_) {}
+    return detail;
+  }
+
+  _emitError(status, message, fatal) {
+    if (this.onError) this.onError({ status, message, fatal });
+  }
+
   // -- Public API --
 
   /**
@@ -193,6 +224,7 @@ export class WhisperClient {
     this._sessionId = crypto.randomUUID();
     this._chunksSent = 0;
     this._totalBytesSent = 0;
+    this._lastChunkError = null;
 
     this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     this._sourceNode = this._audioCtx.createMediaStreamSource(this._mediaStream);
@@ -265,6 +297,13 @@ export class WhisperClient {
     }
 
     if (this._chunksSent === 0) {
+      // Distinguish "genuinely no speech" from "every upload failed" so the
+      // UI doesn't show a misleading empty result when auth/network broke.
+      if (this._lastChunkError) {
+        const err = this._lastChunkError;
+        this._setStatus('error');
+        throw new Error(err.message);
+      }
       this._setStatus('no_speech');
       return { text: '', chunks: 0, file_size_bytes: 0, processing_time_s: 0, model: this.model, language: this.language, prompt: this.prompt };
     }
@@ -580,16 +619,11 @@ export class WhisperClient {
           console.warn(`[WhisperClient] seq=${seq} got ${resp.status}, retrying (${attempt + 1}/${MAX_RETRIES})...`);
           continue;
         }
-        let detail = `HTTP ${resp.status}`;
-        try {
-          const j = await resp.json();
-          const d = j.detail;
-          if (typeof d === 'string') detail = d;
-          else if (Array.isArray(d)) detail = d.map(e => e.msg || JSON.stringify(e)).join('; ');
-          else if (d) detail = JSON.stringify(d);
-        } catch (_) {}
+        const detail = await this._errorDetail(resp);
         console.error(`[WhisperClient] stream utterance seq=${seq} failed: ${detail}`);
         if (this.onTranscript) this.onTranscript({ text: '', sequence: seq, error: detail });
+        // Auth failures are fatal for the whole stream — surface a banner too.
+        if (resp.status === 401 || resp.status === 403) this._emitError(resp.status, detail, true);
         return;
       } catch (err) {
         if (attempt < MAX_RETRIES) {
@@ -637,10 +671,23 @@ export class WhisperClient {
           return;
         }
         if (attempt < 2 && [422, 502, 503, 504].includes(resp.status)) continue;
-        return; // non-retryable error
-      } catch (_) {
+        // Non-retryable error (e.g. 401/403 auth). Record + surface it instead
+        // of silently dropping the chunk — otherwise the whole recording fails
+        // invisibly and stopRecording() returns an empty transcript.
+        const detail = await this._errorDetail(resp);
+        this._lastChunkError = { status: resp.status, message: detail };
+        console.error(`[WhisperClient] chunk upload failed: ${detail}`);
+        // Auth failures won't recover within this recording — stop and notify.
+        const fatal = resp.status === 401 || resp.status === 403;
+        this._emitError(resp.status, detail, fatal);
+        return;
+      } catch (err) {
         if (attempt < 2) continue;
-        // Network error — non-fatal, chunk is lost but recording continues
+        // Network error after retries — record it so stopRecording can report
+        // a failure rather than a misleading "no speech" empty result.
+        this._lastChunkError = { status: null, message: err.message || 'Network error during upload' };
+        console.error('[WhisperClient] chunk upload network error:', err);
+        this._emitError(null, this._lastChunkError.message, false);
       }
     }
   }
