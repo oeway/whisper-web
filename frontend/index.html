@@ -239,9 +239,52 @@ function blockMic(reason) {
   statusText.textContent = reason;
 }
 
+// Map raw getUserMedia / startup errors to a clear, actionable message.
+function friendlyMicError(e) {
+  const name = e && e.name;
+  if (name === 'NotAllowedError' || name === 'SecurityError')
+    return 'Microphone access was blocked. Allow mic permission for this site, then click the mic again.';
+  if (name === 'NotFoundError' || name === 'OverconstrainedError')
+    return 'No microphone found. Connect a mic and reload.';
+  if (name === 'NotReadableError')
+    return 'The microphone is in use by another app. Close it and try again.';
+  if (!window.isSecureContext)
+    return 'Microphone needs a secure (https) context. Open this page over https.';
+  return (e && e.message) || 'Could not start the microphone.';
+}
+
+// Prominent error in the result area — so a failed start is never silent.
+function showStartError(msg) {
+  streamLines.classList.add('hidden');
+  transcriptEl.classList.remove('hidden');
+  transcriptEl.innerHTML = `<span class="text-red-400">⚠ ${msg}</span>`;
+  statusText.textContent = 'Could not start. Fix the issue above and try again.';
+  statusDot.style.backgroundColor = '#f87171';
+}
+
+// ---- Activity watchdog ----
+// Guarantees the UI never "starts" and then sits silent: if no audio is
+// captured / no result or error arrives shortly after starting, tell the user.
+let activitySeen = false;
+let watchdogTimer = null;
+const WATCHDOG_MS = 8000;
+function markActivity() { activitySeen = true; }
+function startWatchdog() {
+  activitySeen = false;
+  clearTimeout(watchdogTimer);
+  watchdogTimer = setTimeout(() => {
+    if ((client.recording || client.streaming) && !activitySeen) {
+      statusText.textContent = 'No audio detected yet — check that your microphone is unmuted and working. Speak, or stop and retry.';
+      statusDot.style.backgroundColor = '#fbbf24';
+    }
+  }, WATCHDOG_MS);
+}
+function stopWatchdog() { clearTimeout(watchdogTimer); watchdogTimer = null; }
+
 // Surface non-retryable background upload failures (e.g. auth) that would
 // otherwise be silent during recording/streaming.
 client.onError = (err) => {
+  markActivity(); // an error is a response — keep the watchdog from also firing
   const msg = err.message || 'Upload failed';
   if (err.status === 401 || err.status === 403) {
     showBanner('<strong>Authentication failed.</strong> Your token is missing or expired — reload with a valid <code class="bg-red-950 px-1 rounded">?token=YOUR_TOKEN</code>.');
@@ -251,6 +294,7 @@ client.onError = (err) => {
   // Stop any in-progress capture so the user isn't left "recording" into a void.
   if (err.fatal) {
     try { client.destroy(); } catch (_) {}
+    stopWatchdog();
     clearInterval(timerInterval);
     setRecordingUI(false);
     micBtn.disabled = false;
@@ -355,6 +399,7 @@ function addStreamLine(text, seq, processingTime) {
 
 // ---- Chunk upload callback (batch mode) ----
 client.onChunkUploaded = (info) => {
+  markActivity();
   chunkInfo.classList.remove('hidden');
   chunkInfo.textContent = `${info.chunks} chunks sent · ${formatBytes(info.totalBytes)} uploaded`;
 };
@@ -366,6 +411,7 @@ micBtn.addEventListener('click', async () => {
 
   if (client.recording || client.streaming) {
     // ---- STOP ----
+    stopWatchdog();
     clearInterval(timerInterval);
     recordDurationS = (Date.now() - recordStart) / 1000;
     setRecordingUI(false);
@@ -444,6 +490,7 @@ micBtn.addEventListener('click', async () => {
       transcriptEl.classList.add('hidden');
 
       client.onTranscript = (r) => {
+        markActivity();
         const text = (r.text || '').trim();
         if (r.error) {
           const errLine = document.createElement('div');
@@ -464,9 +511,7 @@ micBtn.addEventListener('click', async () => {
       try {
         await client.startStreaming();
       } catch (e) {
-        statusText.textContent = e.message;
-        streamLines.classList.add('hidden');
-        transcriptEl.classList.remove('hidden');
+        showStartError(friendlyMicError(e));
         return;
       }
       statusText.textContent = 'Streaming... speak, and transcripts appear live. Click to stop.';
@@ -477,7 +522,7 @@ micBtn.addEventListener('click', async () => {
       try {
         await client.startRecording();
       } catch (e) {
-        statusText.textContent = e.message;
+        showStartError(friendlyMicError(e));
         return;
       }
       statusText.textContent = 'Recording... Click to stop.';
@@ -488,6 +533,7 @@ micBtn.addEventListener('click', async () => {
     updateTimer();
     setRecordingUI(true);
     streamToggle.disabled = true;
+    startWatchdog();
   }
 
 });
