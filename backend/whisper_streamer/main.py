@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile, Query, Header, Depends, Request
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Query, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -1077,6 +1077,197 @@ async def stream_utterance(
     return response
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible transcription API
+# Contract: https://platform.openai.com/docs/api-reference/audio/createTranscription
+# ---------------------------------------------------------------------------
+def _map_openai_model(name: Optional[str]) -> str:
+    """Map an OpenAI model alias (e.g. 'whisper-1') to our internal model size."""
+    if not name:
+        return DEFAULT_MODEL_SIZE
+    n = name.strip().lower()
+    if n in ALLOWED_MODELS:
+        return n
+    # OpenAI aliases all map to our best available model
+    if n in ("whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
+        return DEFAULT_MODEL_SIZE
+    return DEFAULT_MODEL_SIZE
+
+
+def _normalize_words(segment: dict) -> List[dict]:
+    """Coerce word entries into OpenAI's {word,start,end,probability} shape."""
+    words = segment.get("words") or []
+    out = []
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        item = {
+            "word": w.get("word") or w.get("text") or "",
+            "start": float(w.get("start", segment.get("start", 0.0)) or 0.0),
+            "end": float(w.get("end", segment.get("end", 0.0)) or 0.0),
+        }
+        prob = w.get("probability", w.get("score"))
+        if prob is not None:
+            try:
+                item["probability"] = float(prob)
+            except (TypeError, ValueError):
+                pass
+        out.append(item)
+    return out
+
+
+def _build_verbose_json(
+    result: dict,
+    *,
+    audio_bytes_len: int,
+    include_words: bool,
+    include_segments: bool,
+) -> dict:
+    """Format an internal transcription result as OpenAI verbose_json."""
+    raw_segments = result.get("segments") or []
+    text = result.get("text") or ""
+
+    duration = 0.0
+    if raw_segments:
+        try:
+            duration = float(raw_segments[-1].get("end") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+
+    response: dict = {
+        "task": "transcribe",
+        "language": result.get("language") or "en",
+        "duration": duration,
+        "text": text,
+    }
+
+    if include_segments:
+        out_segments = []
+        for idx, s in enumerate(raw_segments):
+            seg = {
+                "id": idx,
+                "seek": 0,
+                "start": float(s.get("start") or 0.0),
+                "end": float(s.get("end") or 0.0),
+                "text": s.get("text") or "",
+                "tokens": s.get("tokens") or [],
+                "temperature": float(s.get("temperature") or 0.0),
+                "avg_logprob": float(s.get("avg_logprob") or 0.0),
+                "compression_ratio": float(s.get("compression_ratio") or 0.0),
+                "no_speech_prob": float(s.get("no_speech_prob") or 0.0),
+            }
+            if include_words:
+                seg["words"] = _normalize_words(s)
+            out_segments.append(seg)
+        response["segments"] = out_segments
+
+    if include_words:
+        flat_words: List[dict] = []
+        for s in raw_segments:
+            flat_words.extend(_normalize_words(s))
+        response["words"] = flat_words
+
+    return response
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_transcriptions(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form("whisper-1"),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: str = Form("json"),
+    temperature: float = Form(0.0),
+    timestamp_granularities: Optional[List[str]] = Form(None),
+    # Accepted-but-ignored knobs sent by some clients (e.g. Vexa bot)
+    max_speech_duration_s: Optional[float] = Form(None),  # noqa: ARG001
+    min_silence_duration_ms: Optional[float] = Form(None),  # noqa: ARG001
+    user: Optional[dict] = Depends(get_current_user),
+):
+    """OpenAI-compatible Whisper transcription endpoint.
+
+    Implements the shape consumed by the OpenAI Python/Node SDKs and any
+    OpenAI-compatible client (Vexa transcription-client, etc.):
+
+        POST /v1/audio/transcriptions
+        multipart/form-data with field `file`
+        Authorization: Bearer <token>
+
+    Word-level timestamps are populated only when the whisperX backend is
+    active (otherwise segments[] is still returned but `words` may be empty).
+    """
+    model_size = _map_openai_model(model)
+    _validate_model_size(model_size)
+
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="empty audio")
+    if len(audio_bytes) > MAX_CHUNK_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"audio exceeds max size ({MAX_CHUNK_BYTES} bytes)",
+        )
+
+    # OpenAI accepts a comma-separated string OR repeated form fields.
+    # `Form(None)` returns a list when repeated, or a single string. Normalize.
+    granularities: set = set()
+    if timestamp_granularities:
+        items = timestamp_granularities if isinstance(timestamp_granularities, list) else [timestamp_granularities]
+        for item in items:
+            for piece in str(item).split(","):
+                piece = piece.strip().lower()
+                if piece:
+                    granularities.add(piece)
+    if not granularities:
+        granularities = {"segment"}
+
+    fmt = (response_format or "json").lower()
+    if fmt not in ("json", "verbose_json", "text"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid response_format '{response_format}', must be 'json', 'verbose_json' or 'text'",
+        )
+    want_words = "word" in granularities or fmt == "verbose_json"
+
+    lang = language.strip() if language and language.strip() and language.strip().lower() != "auto" else None
+    prompt_text = (prompt or "").strip()[-500:] or None
+
+    model_or_repo = await model_pool.get(model_size)
+    t0 = time.monotonic()
+    result = await _run_transcription(
+        model_or_repo, audio_bytes, lang, prompt_text,
+        align=want_words,
+    )
+    text = _filter_hallucination(result["text"])
+    result["text"] = text
+    elapsed = time.monotonic() - t0
+
+    log.info(
+        "OpenAI transcribe (%d bytes) in %.2fs (model=%s, lang=%s, fmt=%s, want_words=%s, user=%s)",
+        len(audio_bytes), elapsed, model_size, language, fmt, want_words,
+        (user or {}).get("email", "anonymous"),
+    )
+    _log_activity(
+        "openai_transcribe", user=user, model=model_size, language=language or "auto",
+        file_size_bytes=len(audio_bytes), processing_time_s=round(elapsed, 3),
+        text_length=len(text),
+        client_ip=request.client.host if request.client else None,
+    )
+
+    if fmt == "text":
+        return PlainTextResponse(content=text)
+
+    if fmt == "json":
+        return {"text": text}
+
+    # verbose_json
+    return _build_verbose_json(
+        result,
+        audio_bytes_len=len(audio_bytes),
+        include_words=want_words,
+        include_segments=True,
+    )
 
 
 # ---------------------------------------------------------------------------
