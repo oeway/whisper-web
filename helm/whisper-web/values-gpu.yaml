@@ -120,10 +120,14 @@ resources:
     cpu: "6"
     memory: 16Gi
 
+# Pin to a single replica. The PVC is RWO so a second pod would stay
+# Pending with Multi-Attach. Even with RWX, a second pod competes for the
+# same time-sliced A40 slot and adds little throughput — better to raise
+# WHISPER_MAX_WORKERS within one pod than scale out.
 hpa:
-  enabled: true
+  enabled: false
   minReplicas: 1
-  maxReplicas: 3
+  maxReplicas: 1
   targetCPUUtilizationPercentage: 70
 
 sessionAffinity:
