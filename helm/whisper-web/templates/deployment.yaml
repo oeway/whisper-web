@@ -31,7 +31,7 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.modelCache.enabled }}
+      {{- if and .Values.modelCache.enabled .Values.modelCache.fixPermsInitContainer }}
       initContainers:
         - name: fix-model-cache-perms
           image: busybox

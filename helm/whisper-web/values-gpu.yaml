@@ -67,6 +67,9 @@ gpu:
 modelCache:
   enabled: true
   size: 20Gi
+  # Cluster enforces PodSecurity "restricted" → can't run root init container.
+  # fsGroup on the NetApp Trident CSI handles ownership on mount.
+  fixPermsInitContainer: false
 
 podSecurityContext:
   runAsNonRoot: true
@@ -131,5 +134,10 @@ sessionAffinity:
 nodeSelector:
   nvidia.com/gpu.present: "true"
 
-tolerations: []
+# GPU nodes carry an nvidia.com/gpu:NoSchedule taint so general workloads
+# don't steal the slots — tolerate it so we can land there.
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
 affinity: {}

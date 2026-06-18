@@ -74,6 +74,10 @@ modelCache:
   # storageClassName: standard
   size: 10Gi
   # existingClaim: ""   # reuse an existing PVC instead of creating one
+  # Run an init container as root to chown /data to uid 1000.
+  # Disable when the cluster enforces PodSecurity "restricted" — fsGroup will
+  # handle volume ownership instead.
+  fixPermsInitContainer: true
 
 podSecurityContext:
   runAsNonRoot: true
