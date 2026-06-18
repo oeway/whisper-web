@@ -8,6 +8,11 @@ image:
 service:
   type: ClusterIP
   port: 8000
+  # Override the app.kubernetes.io/instance label this Service selects on.
+  # Defaults to the release name; set to another release name to point this
+  # Service at that release's pods (useful for blue/green or routing the
+  # existing whisper.hypha.aicell.io service at the GPU release's pods).
+  # selectorInstance: whisper-web-gpu
 
 ingress:
   enabled: true
@@ -32,6 +37,10 @@ ingress:
   host: whisper.hypha.aicell.io
   tls:
     secretName: whisper.hypha.aicell.io-tls
+  # Optional: route this ingress at another release's service. Defaults to
+  # the current release name. Useful for switching whisper.hypha.aicell.io
+  # to the GPU release without recreating the ingress / TLS secret.
+  # backendService: whisper-web-gpu
 
 # Whisper model and runtime configuration.
 # Recommended compute types by backend:
