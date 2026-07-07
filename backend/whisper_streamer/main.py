@@ -98,6 +98,14 @@ INFERENCE_TIMEOUT = float(os.getenv("WHISPER_INFERENCE_TIMEOUT", "120"))
 SESSION_TTL_SECONDS = int(os.getenv("WHISPER_SESSION_TTL", "600"))  # 10 minutes
 MAX_SESSIONS = int(os.getenv("WHISPER_MAX_SESSIONS", "200"))  # cap concurrent sessions
 MAX_ALIGN_LANGUAGES = 5  # cap cached alignment models to limit memory
+# Comma-separated language codes whose whisperX alignment model should be
+# loaded at startup. The alignment model download is the biggest single
+# cold-start cost after the whisperX model itself; preloading it makes
+# the first post-restart transcription snappy. Set to "" to disable.
+WHISPERX_PRELOAD_LANGUAGES = [
+    lang.strip() for lang in os.getenv("WHISPERX_PRELOAD_LANGUAGES", "en").split(",")
+    if lang.strip()
+]
 
 # Auth: set WHISPER_REQUIRE_AUTH=true to require Hypha token validation
 REQUIRE_AUTH = os.getenv("WHISPER_REQUIRE_AUTH", "").lower() in ("true", "1", "yes")
@@ -758,6 +766,18 @@ async def _startup():
     log.info("Preloading default model '%s' ...", DEFAULT_MODEL_SIZE)
     await model_pool.preload(DEFAULT_MODEL_SIZE)
 
+    if USE_WHISPERX and WHISPERX_PRELOAD_LANGUAGES:
+        device = DEFAULT_DEVICE if DEFAULT_DEVICE != "auto" else "cpu"
+        loop = asyncio.get_event_loop()
+        for lang in WHISPERX_PRELOAD_LANGUAGES:
+            try:
+                log.info("Preloading whisperX alignment model for '%s' ...", lang)
+                await loop.run_in_executor(
+                    _transcription_executor, _wx_get_align_model, lang, device
+                )
+            except Exception as exc:
+                log.warning("Alignment preload failed for '%s' (continuing): %s", lang, exc)
+
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -788,6 +808,7 @@ async def health():
             "streaming": True,
             "word_alignment": USE_WHISPERX,
         },
+        "loaded_alignment_languages": list(_wx_align_models.keys()) if USE_WHISPERX else [],
         "concurrency": {
             "max_workers": MAX_WORKERS,
             "max_queue": MAX_QUEUE,
