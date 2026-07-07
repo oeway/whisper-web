@@ -1,29 +1,30 @@
+# Default deployment: GPU + whisperX on the scilifelab-2-dev A40 pool.
+# Serves whisper.hypha.aicell.io behind an nginx ingress with a cluster-wide
+# wildcard TLS secret. Single replica because the model-cache PVC is RWO;
+# raise WHISPER_MAX_WORKERS instead of scaling out.
+
 replicaCount: 1
 
 image:
   repository: ghcr.io/oeway/whisper-web
-  tag: "main"
+  tag: "main-gpu"
   pullPolicy: Always
 
 service:
   type: ClusterIP
   port: 8000
   # Override the app.kubernetes.io/instance label this Service selects on.
-  # Defaults to the release name; set to another release name to point this
-  # Service at that release's pods (useful for blue/green or routing the
-  # existing whisper.hypha.aicell.io service at the GPU release's pods).
+  # Defaults to the release name; used historically to point whisper-web's
+  # Service at the whisper-web-gpu release's pods during migration.
   # selectorInstance: whisper-web-gpu
 
 ingress:
   enabled: true
   className: nginx
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/proxy-body-size: 100m
-    # Increase timeouts for long transcription requests (must exceed WHISPER_INFERENCE_TIMEOUT)
     nginx.ingress.kubernetes.io/proxy-read-timeout: "360"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "360"
-    # Sticky sessions for batch mode — route same client to same pod
     nginx.ingress.kubernetes.io/affinity: "cookie"
     nginx.ingress.kubernetes.io/affinity-mode: "persistent"
     nginx.ingress.kubernetes.io/session-cookie-name: "whisper-sticky"
@@ -35,58 +36,44 @@ ingress:
     nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
     nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Authorization"
   host: whisper.hypha.aicell.io
+  # Cluster-wide wildcard from the kth-k8s TLS migration. The per-host
+  # cert-manager Certificate is no longer used — do NOT re-add the
+  # cert-manager.io/cluster-issuer annotation, it would recreate that
+  # object and conflict with the wildcard.
   tls:
-    secretName: whisper.hypha.aicell.io-tls
-  # Optional: route this ingress at another release's service. Defaults to
-  # the current release name. Useful for switching whisper.hypha.aicell.io
-  # to the GPU release without recreating the ingress / TLS secret.
+    secretName: hypha-aicell-io-wildcard-tls
+  # Optional override to route this ingress at another release's Service.
   # backendService: whisper-web-gpu
 
-# Whisper model and runtime configuration.
-# Recommended compute types by backend:
-#   CPU:          int8_float32  (fast, low memory, good accuracy)
-#   CUDA GPU:     float16       (fast, requires CUDA 11+)
-#   Apple M-chip: mlx-float16   (auto-selected when mlx-whisper is installed)
 env:
-  WHISPER_MODEL_SIZE: "small"
-  WHISPER_DEVICE: "cpu"
-  WHISPER_COMPUTE_TYPE: "int8_float32"
-  # Number of concurrent inference threads per pod.
-  # Rule of thumb: set to half the pod's CPU limit (e.g. 4 CPUs → 2 workers).
-  # Automatically capped to 1 when using the MLX/Metal GPU backend.
+  WHISPER_BACKEND: "whisperx"
+  WHISPER_MODEL_SIZE: "large-v3"
+  WHISPER_DEVICE: "cuda"
+  WHISPER_COMPUTE_TYPE: "float16"
+  # whisperX is GPU-bound; two workers max out one A40 time-slice.
   WHISPER_MAX_WORKERS: "2"
-  # Maximum in-flight requests before 429 is returned (queue = workers × 8 by default).
-  # WHISPER_MAX_QUEUE: "16"
-  # Per-request inference timeout in seconds.
-  # Raised to 300s to support long recordings (~10+ min) on CPU.
-  WHISPER_INFERENCE_TIMEOUT: "300"
-  # Number of uvicorn worker processes per pod.
-  # Increase only if CPU-bound and each worker's RAM cost is acceptable.
+  WHISPER_MAX_QUEUE: "32"
+  WHISPER_INFERENCE_TIMEOUT: "120"
+  WHISPERX_BATCH_SIZE: "8"
   UVICORN_WORKERS: "1"
   WHISPER_REQUIRE_AUTH: "true"
   HYPHA_TOKEN_URL: "https://hypha.aicell.io/public/services/ws/parse_token"
 
-# ── GPU support ──────────────────────────────────────────────────────────────
-# Set gpu.enabled=true to request an NVIDIA GPU.
-# Also set env.WHISPER_DEVICE=cuda and env.WHISPER_COMPUTE_TYPE=float16.
-# The image must be built with the [cuda] extra: pip install ./backend[cuda]
 gpu:
-  enabled: false
-  # resource: nvidia.com/gpu   # or amd.com/gpu
-  # count: 1
+  enabled: true
+  resource: nvidia.com/gpu
+  count: 1
 
-# ── Model cache PersistentVolumeClaim ────────────────────────────────────────
-# Mount a PVC at /data so HuggingFace model files survive pod restarts.
-# Without this, each new pod downloads the model from the internet on startup.
+# Reuse the PVC that whisper-web-gpu previously owned — its 20Gi already
+# holds the large-v3 weights and the EN alignment model, so a fresh pod
+# skips the multi-GB HuggingFace download on startup.
 modelCache:
-  enabled: false
-  # storageClassName: standard
-  size: 10Gi
-  # existingClaim: ""   # reuse an existing PVC instead of creating one
-  # Run an init container as root to chown /data to uid 1000.
-  # Disable when the cluster enforces PodSecurity "restricted" — fsGroup will
-  # handle volume ownership instead.
-  fixPermsInitContainer: true
+  enabled: true
+  size: 20Gi
+  existingClaim: whisper-web-gpu-model-cache
+  # PodSecurity "restricted" blocks the root chown init container.
+  # fsGroup on the NetApp Trident CSI handles ownership on mount.
+  fixPermsInitContainer: false
 
 podSecurityContext:
   runAsNonRoot: true
@@ -106,16 +93,16 @@ startupProbe:
   httpGet:
     path: /health/readiness
     port: http
-  initialDelaySeconds: 10
-  periodSeconds: 10
+  initialDelaySeconds: 30
+  periodSeconds: 15
   timeoutSeconds: 10
-  failureThreshold: 60  # up to 10 + 60×10 = 610 s for large model downloads
+  failureThreshold: 80
 
 livenessProbe:
   httpGet:
     path: /health/liveness
     port: http
-  initialDelaySeconds: 30
+  initialDelaySeconds: 60
   periodSeconds: 30
   timeoutSeconds: 10
   failureThreshold: 3
@@ -124,37 +111,41 @@ readinessProbe:
   httpGet:
     path: /health/readiness
     port: http
-  initialDelaySeconds: 10
-  periodSeconds: 10
+  initialDelaySeconds: 30
+  periodSeconds: 15
   timeoutSeconds: 10
   failureThreshold: 3
 
-# CPU-only defaults. Adjust for GPU nodes: increase memory to 8Gi+.
 resources:
   requests:
-    cpu: "1"
-    memory: 2Gi
+    cpu: "2"
+    memory: 8Gi
   limits:
-    cpu: "4"
-    memory: 4Gi
+    cpu: "6"
+    memory: 16Gi
 
-# ── Horizontal Pod Autoscaler ─────────────────────────────────────────────────
-# Scales pods based on CPU utilization.
-# Only effective when the /api/transcribe (stateless) endpoint is used;
-# batch-mode sessions require sticky sessions (sessionAffinity: ClientIP).
+# HPA disabled: model-cache PVC is RWO so a second replica stays Pending
+# with Multi-Attach, and a second pod would compete for the same
+# time-sliced A40 slot. Raise WHISPER_MAX_WORKERS if more throughput is
+# needed.
 hpa:
-  enabled: true
+  enabled: false
   minReplicas: 1
-  maxReplicas: 5
+  maxReplicas: 1
   targetCPUUtilizationPercentage: 70
 
-# ── Session affinity ──────────────────────────────────────────────────────────
-# Required when using the stateful session API (/api/session/…) with >1 replica.
-# Also helpful for live streaming so utterances from the same user hit the same pod.
 sessionAffinity:
   enabled: true
   timeoutSeconds: 10800
 
-nodeSelector: {}
-tolerations: []
+# Pin to the A40 time-sliced GPU pool.
+nodeSelector:
+  nvidia.com/gpu.present: "true"
+
+# GPU nodes carry an nvidia.com/gpu:NoSchedule taint so general workloads
+# don't steal the slots — tolerate it.
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
 affinity: {}
